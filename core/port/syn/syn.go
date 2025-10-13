@@ -646,6 +646,9 @@ func (ss *SynScanner) recv() {
 	var disIp net.IP
 
 	for {
+		if ss.isDone {
+			return
+		}
 		// Read in the next packet.
 		data, _, err = ss.handle.ReadPacketData()
 		if err != nil {
