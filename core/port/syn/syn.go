@@ -294,8 +294,6 @@ func (ss *SynScanner) Close() {
 	if ss.watchIpStatusT != nil {
 		ss.watchIpStatusT.Close()
 	}
-	ss.watchMacCacheT = nil
-	ss.watchIpStatusT = nil
 	close(ss.openPortChan)
 	close(ss.retChan)
 }
@@ -685,9 +683,6 @@ func (ss *SynScanner) recv() {
 		// ipv6NA
 		if len(ipv6IcmpNALayer.Options) != 0 {
 			ipStr = net.IP(arpLayer.SourceProtAddress).String()
-			if ss.isDone {
-				return
-			}
 			if ss.watchMacCacheT.IsNeedWatch(ipStr) {
 				ss.watchMacCacheT.SetMac(ipStr, arpLayer.SourceHwAddress)
 			}
@@ -708,9 +703,6 @@ func (ss *SynScanner) recv() {
 		if tcpLayer.DstPort != 0 && tcpLayer.DstPort >= 49000 && tcpLayer.DstPort <= 59000 {
 			ipStr = disIp.String()
 			_port = uint16(tcpLayer.SrcPort)
-			if ss.isDone {
-				return
-			}
 			ipOption, has := ss.watchIpStatusT.GetIpOption(ipStr)
 			if !has { // IP
 				continue
