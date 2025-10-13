@@ -85,6 +85,9 @@ func (w *watchMacCacheTable) IsEmpty() (empty bool) {
 
 func (w *watchMacCacheTable) Close() {
 	w.isDone = true
+	w.lock.Lock()
+	w.watchMacC = make(map[string]*watchMacCache)
+	w.lock.Unlock()
 }
 
 // 清理过期数据

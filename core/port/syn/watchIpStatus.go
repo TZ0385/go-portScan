@@ -84,6 +84,9 @@ func (w *watchIpStatusTable) IsEmpty() (empty bool) {
 
 func (w *watchIpStatusTable) Close() {
 	w.isDone = true
+	w.lock.Lock()
+	w.watchIpS = make(map[string]*watchIpStatus)
+	w.lock.Unlock()
 }
 
 // 清理过期数据

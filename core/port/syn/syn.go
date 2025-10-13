@@ -113,7 +113,7 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 
 	// Pcap
 	// 每个包最大读取长度1024, 不开启混杂模式, no TimeOut
-	handle, err := pcap.OpenLive(devName, 1024, false, pcap.BlockForever)
+	handle, err := pcap.OpenLive(devName, 1024, false, 10*time.Minute)
 	if err != nil {
 		return
 	}
@@ -669,6 +669,9 @@ func (ss *SynScanner) recv() {
 		// arp
 		if arpLayer.SourceProtAddress != nil {
 			ipStr = net.IP(arpLayer.SourceProtAddress).String()
+			if ss.isDone {
+				return
+			}
 			if ss.watchMacCacheT.IsNeedWatch(ipStr) {
 				ss.watchMacCacheT.SetMac(ipStr, arpLayer.SourceHwAddress)
 			}
@@ -679,6 +682,9 @@ func (ss *SynScanner) recv() {
 		// ipv6NA
 		if len(ipv6IcmpNALayer.Options) != 0 {
 			ipStr = net.IP(arpLayer.SourceProtAddress).String()
+			if ss.isDone {
+				return
+			}
 			if ss.watchMacCacheT.IsNeedWatch(ipStr) {
 				ss.watchMacCacheT.SetMac(ipStr, arpLayer.SourceHwAddress)
 			}
@@ -699,6 +705,9 @@ func (ss *SynScanner) recv() {
 		if tcpLayer.DstPort != 0 && tcpLayer.DstPort >= 49000 && tcpLayer.DstPort <= 59000 {
 			ipStr = disIp.String()
 			_port = uint16(tcpLayer.SrcPort)
+			if ss.isDone {
+				return
+			}
 			ipOption, has := ss.watchIpStatusT.GetIpOption(ipStr)
 			if !has { // IP
 				continue
