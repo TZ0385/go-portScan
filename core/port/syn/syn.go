@@ -113,7 +113,7 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 
 	// Pcap
 	// 每个包最大读取长度1024, 不开启混杂模式, no TimeOut
-	handle, err := pcap.OpenLive(devName, 1024, false, 10*time.Minute)
+	handle, err := pcap.OpenLive(devName, 1024, false, pcap.BlockForever)
 	if err != nil {
 		return
 	}
@@ -644,9 +644,6 @@ func (ss *SynScanner) recv() {
 	var disIp net.IP
 
 	for {
-		if ss.isDone {
-			return
-		}
 		// Read in the next packet.
 		data, _, err = ss.handle.ReadPacketData()
 		if err != nil {
@@ -670,9 +667,6 @@ func (ss *SynScanner) recv() {
 		// arp
 		if arpLayer.SourceProtAddress != nil {
 			ipStr = net.IP(arpLayer.SourceProtAddress).String()
-			if ss.isDone {
-				return
-			}
 			if ss.watchMacCacheT.IsNeedWatch(ipStr) {
 				ss.watchMacCacheT.SetMac(ipStr, arpLayer.SourceHwAddress)
 			}
