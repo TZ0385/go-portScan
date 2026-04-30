@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -89,7 +90,9 @@ func IcmpOK(host string) bool {
 // TcpPing 指定默认常见端口进行存活探测
 func TcpPing(host string, ports []uint16, timeout time.Duration) (ok bool) {
 	var wg sync.WaitGroup
+	var live atomic.Bool
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	d := net.Dialer{
 		Timeout:   timeout + time.Second,
 		KeepAlive: 0,
@@ -101,16 +104,16 @@ func TcpPing(host string, ports []uint16, timeout time.Duration) (ok bool) {
 			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(_port))))
 			if conn != nil {
 				conn.Close()
-				ok = true
+				live.Store(true)
 			} else if err != nil && strings.Contains(err.Error(), "refused it") { // 表明对端发送了RST包
-				ok = true
+				live.Store(true)
 			}
-			if ok {
+			if live.Load() {
 				cancel()
 			}
 			wg.Done()
 		}(port)
 	}
 	wg.Wait()
-	return
+	return live.Load()
 }
