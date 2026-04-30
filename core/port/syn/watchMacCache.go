@@ -5,6 +5,7 @@ package syn
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,7 +18,7 @@ type watchMacCache struct {
 type watchMacCacheTable struct {
 	watchMacC map[string]*watchMacCache
 	lock      sync.RWMutex
-	isDone    bool
+	isDone    atomic.Bool
 }
 
 func newWatchMacCacheTable() (w *watchMacCacheTable) {
@@ -84,7 +85,7 @@ func (w *watchMacCacheTable) IsEmpty() (empty bool) {
 }
 
 func (w *watchMacCacheTable) Close() {
-	w.isDone = true
+	w.isDone.Store(true)
 	w.lock.Lock()
 	w.watchMacC = make(map[string]*watchMacCache)
 	w.lock.Unlock()
@@ -95,7 +96,7 @@ func (w *watchMacCacheTable) cleanTimeout() {
 	var needDel map[string]struct{}
 	for {
 		needDel = make(map[string]struct{})
-		if w.isDone {
+		if w.isDone.Load() {
 			break
 		}
 		time.Sleep(2 * time.Second)

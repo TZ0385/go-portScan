@@ -5,6 +5,7 @@ package syn
 import (
 	"github.com/XinRoom/go-portScan/core/port"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,7 +19,7 @@ type watchIpStatus struct {
 type watchIpStatusTable struct {
 	watchIpS map[string]*watchIpStatus
 	lock     sync.RWMutex
-	isDone   bool
+	isDone   atomic.Bool
 }
 
 func newWatchIpStatusTable(timeout time.Duration) (w *watchIpStatusTable) {
@@ -83,7 +84,7 @@ func (w *watchIpStatusTable) IsEmpty() (empty bool) {
 }
 
 func (w *watchIpStatusTable) Close() {
-	w.isDone = true
+	w.isDone.Store(true)
 	w.lock.Lock()
 	w.watchIpS = make(map[string]*watchIpStatus)
 	w.lock.Unlock()
@@ -94,13 +95,13 @@ func (w *watchIpStatusTable) cleanTimeout(timeout time.Duration) {
 	var needDel map[string]struct{}
 	for {
 		needDel = make(map[string]struct{})
-		if w.isDone {
+		if w.isDone.Load() {
 			break
 		}
 		time.Sleep(time.Second)
 		w.lock.RLock()
 		for k, v := range w.watchIpS {
-			if time.Since(v.LastTime) > timeout*time.Millisecond {
+			if time.Since(v.LastTime) > timeout {
 				needDel[k] = struct{}{}
 			}
 		}

@@ -7,12 +7,16 @@ import (
 	"github.com/panjf2000/ants/v2"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestSynScanner_Scan(t *testing.T) {
+func TestSynScannerScanIntegration(t *testing.T) {
+	if os.Getenv("GO_PORTSCAN_RUN_SYN_INTEGRATION") != "1" {
+		t.Skip("set GO_PORTSCAN_RUN_SYN_INTEGRATION=1 to run SYN scanner integration test")
+	}
 
 	single := make(chan struct{})
 	retChan := make(chan port.OpenIpPort, 65535)

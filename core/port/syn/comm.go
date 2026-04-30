@@ -8,7 +8,8 @@ import (
 var ErrorNoSyn = errors.New("no syn support")
 
 var DefaultSynOption = port.ScannerOption{
-	Rate:     1500,
-	MiniRate: 500,
-	Timeout:  800,
+	Rate:          1500,
+	MiniRate:      500,
+	Timeout:       800,
+	FingerTimeout: 2000,
 }

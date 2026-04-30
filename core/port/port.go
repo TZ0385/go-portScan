@@ -4,10 +4,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/XinRoom/go-portScan/util"
 	"net"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/XinRoom/go-portScan/util"
+)
+
+const (
+	MinProbeConcurrency     = 8
+	MaxProbeConcurrency     = 256
+	DefaultProbeConcurrency = 16
+	MinProbeRate            = 4
+	MaxProbeRate            = 512
+	DefaultProbeRate        = 50
 )
 
 // TopTcpPorts 常见端口 ref https://github.com/robertdavidgraham/masscan/blob/master/src/main-conf.c
@@ -130,7 +141,7 @@ type OpenIpPort struct {
 	Service  string    `json:"service"`
 	Banner   []byte    `json:"banner,omitempty"`
 	HttpInfo *HttpInfo `json:"http_info,omitempty"`
-	IpOption           `json:"-"`
+	IpOption `json:"-"`
 }
 
 func (op OpenIpPort) String() string {
@@ -154,11 +165,87 @@ func (op OpenIpPort) Json() string {
 
 // ScannerOption 扫描器初始化参数
 type ScannerOption struct {
-	Rate     int    // 每秒速度限制, 单位: s, 会在1s内平均发送, 相当于每个包之间的延迟
-	MiniRate int    // 最小每秒速度，避免自动调速太低, 单位: s,  0为不设置
-	Timeout  int    // TCP连接响应延迟, 单位: ms
-	NextHop  string // pcap dev name
-	Debug    bool
+	Rate     int // 每秒速度限制, 单位: s, 会在1s内平均发送, 相当于每个包之间的延迟
+	MiniRate int // 最小每秒速度，避免自动调速太低, 单位: s,  0为不设置
+	Timeout  int // TCP连接响应延迟, 单位: ms
+	// FingerTimeout controls active service/http fingerprint probes, in ms.
+	FingerTimeout int
+	// ProbeRate controls service/http fingerprint probe start rate, per second.
+	ProbeRate int
+	NextHop   string // pcap dev name
+	Debug     bool
+}
+
+func NormalizeMiniRate(rate, miniRate int) int {
+	if miniRate <= 0 {
+		return 0
+	}
+	if rate > 0 && miniRate > rate {
+		return rate
+	}
+	return miniRate
+}
+
+func FingerTimeout(timeout, fingerTimeout int) int {
+	if fingerTimeout > 0 {
+		return fingerTimeout
+	}
+	// Finger probes usually need a wider budget than the raw connect timeout.
+	if timeout > 2000 {
+		return timeout
+	}
+	return 2000
+}
+
+func (so ScannerOption) FingerTimeoutDuration() time.Duration {
+	return time.Duration(FingerTimeout(so.Timeout, so.FingerTimeout)) * time.Millisecond
+}
+
+func ProbeConcurrency(rate int) int {
+	if rate <= 0 {
+		return DefaultProbeConcurrency
+	}
+	// Keep enrichment fan-out below the raw scan rate so open ports do not stall scanning.
+	concurrency := rate / 10
+	if concurrency < MinProbeConcurrency {
+		return MinProbeConcurrency
+	}
+	if concurrency > MaxProbeConcurrency {
+		return MaxProbeConcurrency
+	}
+	return concurrency
+}
+
+func ProbeRate(scanRate, probeRate int) int {
+	if probeRate > 0 {
+		if probeRate > MaxProbeRate {
+			return MaxProbeRate
+		}
+		return probeRate
+	}
+	if scanRate <= 0 {
+		return DefaultProbeRate
+	}
+	// Probe start rate defaults lower than scan rate because each probe may do multiple round trips.
+	rate := scanRate / 5
+	if rate < MinProbeRate {
+		return MinProbeRate
+	}
+	if rate > MaxProbeRate {
+		return MaxProbeRate
+	}
+	return rate
+}
+
+func ProbeLimiterBurst(probeRate int) int {
+	if probeRate <= 1 {
+		return 1
+	}
+	burst := probeRate / 10
+	if burst < 1 {
+		return 1
+	}
+	return burst
 }
 
 // IpOption 对开放端口进一步处理参数
