@@ -12,15 +12,6 @@ import (
 	"github.com/XinRoom/go-portScan/util"
 )
 
-const (
-	MinProbeConcurrency     = 8
-	MaxProbeConcurrency     = 256
-	DefaultProbeConcurrency = 16
-	MinProbeRate            = 4
-	MaxProbeRate            = 512
-	DefaultProbeRate        = 50
-)
-
 // TopTcpPorts 常见端口 ref https://github.com/robertdavidgraham/masscan/blob/master/src/main-conf.c
 var TopTcpPorts = []uint16{
 	80, 443, 8080, /* also web */
@@ -170,10 +161,8 @@ type ScannerOption struct {
 	Timeout  int // TCP连接响应延迟, 单位: ms
 	// FingerTimeout controls active service/http fingerprint probes, in ms.
 	FingerTimeout int
-	// ProbeRate controls service/http fingerprint probe start rate, per second.
-	ProbeRate int
-	NextHop   string // pcap dev name
-	Debug     bool
+	NextHop       string // pcap dev name
+	Debug         bool
 }
 
 func NormalizeMiniRate(rate, miniRate int) int {
@@ -199,53 +188,6 @@ func FingerTimeout(timeout, fingerTimeout int) int {
 
 func (so ScannerOption) FingerTimeoutDuration() time.Duration {
 	return time.Duration(FingerTimeout(so.Timeout, so.FingerTimeout)) * time.Millisecond
-}
-
-func ProbeConcurrency(rate int) int {
-	if rate <= 0 {
-		return DefaultProbeConcurrency
-	}
-	// Keep enrichment fan-out below the raw scan rate so open ports do not stall scanning.
-	concurrency := rate / 10
-	if concurrency < MinProbeConcurrency {
-		return MinProbeConcurrency
-	}
-	if concurrency > MaxProbeConcurrency {
-		return MaxProbeConcurrency
-	}
-	return concurrency
-}
-
-func ProbeRate(scanRate, probeRate int) int {
-	if probeRate > 0 {
-		if probeRate > MaxProbeRate {
-			return MaxProbeRate
-		}
-		return probeRate
-	}
-	if scanRate <= 0 {
-		return DefaultProbeRate
-	}
-	// Probe start rate defaults lower than scan rate because each probe may do multiple round trips.
-	rate := scanRate / 5
-	if rate < MinProbeRate {
-		return MinProbeRate
-	}
-	if rate > MaxProbeRate {
-		return MaxProbeRate
-	}
-	return rate
-}
-
-func ProbeLimiterBurst(probeRate int) int {
-	if probeRate <= 1 {
-		return 1
-	}
-	burst := probeRate / 10
-	if burst < 1 {
-		return 1
-	}
-	return burst
 }
 
 // IpOption 对开放端口进一步处理参数

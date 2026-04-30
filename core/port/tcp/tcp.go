@@ -21,18 +21,16 @@ var DefaultTcpOption = port.ScannerOption{
 }
 
 type TcpScanner struct {
-	ports        []uint16             // 指定端口
-	retChan      chan port.OpenIpPort // 返回值队列
-	limiter      *limiter.Limiter
-	ctx          context.Context
-	cancel       context.CancelFunc
-	timeout      time.Duration
-	isDone       atomic.Bool
-	option       port.ScannerOption
-	wg           sync.WaitGroup
-	closeOnce    sync.Once
-	probe        chan struct{}
-	probeLimiter *limiter.Limiter
+	ports     []uint16             // 指定端口
+	retChan   chan port.OpenIpPort // 返回值队列
+	limiter   *limiter.Limiter
+	ctx       context.Context
+	cancel    context.CancelFunc
+	timeout   time.Duration
+	isDone    atomic.Bool
+	option    port.ScannerOption
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // NewTcpScanner Tcp扫描器
@@ -47,7 +45,6 @@ func NewTcpScanner(retChan chan port.OpenIpPort, option port.ScannerOption) (ts 
 		return
 	}
 
-	probeRate := port.ProbeRate(option.Rate, option.ProbeRate)
 	ctx, cancel := context.WithCancel(context.Background())
 	ts = &TcpScanner{
 		retChan: retChan,
@@ -56,11 +53,6 @@ func NewTcpScanner(retChan chan port.OpenIpPort, option port.ScannerOption) (ts 
 		cancel:  cancel,
 		timeout: time.Duration(option.Timeout) * time.Millisecond,
 		option:  option,
-		probe:   make(chan struct{}, port.ProbeConcurrency(option.Rate)),
-		probeLimiter: limiter.NewLimiter(
-			limiter.Every(time.Second/time.Duration(probeRate)),
-			port.ProbeLimiterBurst(probeRate),
-		),
 	}
 
 	return
@@ -93,22 +85,11 @@ func (ts *TcpScanner) Scan(ip net.IP, dst uint16, ipOption port.IpOption) error 
 			return
 		}
 
-		if !ts.acquireProbe() {
-			return
-		}
-		defer func() {
-			ts.releaseProbe()
-		}()
-
 		// The initial TCP connect above already confirmed the port is open.
 		// Later probe dial/timeouts only mean enrichment failed, not that the port disappeared.
 		var probeDialErr bool
 		fingerTimeout := ts.option.FingerTimeoutDuration()
 		if ipOption.FingerPrint {
-			if err := ts.WaitProbeLimiter(); err != nil {
-				ts.emitResult(openIpPort)
-				return
-			}
 			openIpPort.Service, openIpPort.Banner, probeDialErr = fingerprint.PortIdentify("tcp", ip, dst, fingerTimeout)
 			if probeDialErr {
 				ts.emitResult(openIpPort)
@@ -116,10 +97,6 @@ func (ts *TcpScanner) Scan(ip net.IP, dst uint16, ipOption port.IpOption) error 
 			}
 		}
 		if ipOption.Httpx && (openIpPort.Service == "" || openIpPort.Service == "http" || openIpPort.Service == "https") {
-			if err := ts.WaitProbeLimiter(); err != nil {
-				ts.emitResult(openIpPort)
-				return
-			}
 			openIpPort.HttpInfo, openIpPort.Banner, probeDialErr = fingerprint.ProbeHttpInfo(ip.String(), dst, openIpPort.Service, fingerTimeout)
 			if probeDialErr {
 				ts.emitResult(openIpPort)
@@ -158,29 +135,6 @@ func (ts *TcpScanner) Close() {
 // WaitLimiter Waiting for the speed limit
 func (ts *TcpScanner) WaitLimiter() error {
 	return ts.limiter.Wait(ts.ctx)
-}
-
-func (ts *TcpScanner) WaitProbeLimiter() error {
-	if ts.probeLimiter == nil {
-		return nil
-	}
-	return ts.probeLimiter.Wait(ts.ctx)
-}
-
-func (ts *TcpScanner) acquireProbe() bool {
-	select {
-	case ts.probe <- struct{}{}:
-		return true
-	case <-ts.ctx.Done():
-		return false
-	}
-}
-
-func (ts *TcpScanner) releaseProbe() {
-	select {
-	case <-ts.probe:
-	default:
-	}
 }
 
 func (ts *TcpScanner) emitResult(openIpPort port.OpenIpPort) bool {

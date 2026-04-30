@@ -43,10 +43,8 @@ type SynScanner struct {
 	portProbeWg    sync.WaitGroup
 	retChan        chan port.OpenIpPort // results chan
 	limiter        *limiter.Limiter
-	probeLimiter   *limiter.Limiter
 	ctx            context.Context
 	cancel         context.CancelFunc
-	probe          chan struct{}
 	watchIpStatusT *watchIpStatusTable // IpStatusCacheTable
 	watchMacCacheT *watchMacCacheTable // MacCaches
 	isDone         atomic.Bool
@@ -93,7 +91,6 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 
 	rand.Seed(time.Now().Unix())
 
-	probeRate := port.ProbeRate(option.Rate, option.ProbeRate)
 	ctx, cancel := context.WithCancel(context.Background())
 	ss = &SynScanner{
 		opts: gopacket.SerializeOptions{
@@ -109,17 +106,12 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 				return gopacket.NewSerializeBuffer()
 			},
 		},
-		option:       option,
-		openPortChan: make(chan port.OpenIpPort, cap(retChan)),
-		retChan:      retChan,
-		limiter:      limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
-		probeLimiter: limiter.NewLimiter(
-			limiter.Every(time.Second/time.Duration(probeRate)),
-			port.ProbeLimiterBurst(probeRate),
-		),
+		option:         option,
+		openPortChan:   make(chan port.OpenIpPort, cap(retChan)),
+		retChan:        retChan,
+		limiter:        limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
 		ctx:            ctx,
 		cancel:         cancel,
-		probe:          make(chan struct{}, port.ProbeConcurrency(option.Rate)),
 		watchIpStatusT: newWatchIpStatusTable(time.Duration(option.Timeout) * time.Millisecond),
 		watchMacCacheT: newWatchMacCacheTable(),
 	}
@@ -335,13 +327,6 @@ func (ss *SynScanner) WaitLimiter() error {
 	return ss.limiter.Wait(ss.ctx)
 }
 
-func (ss *SynScanner) WaitProbeLimiter() error {
-	if ss.probeLimiter == nil {
-		return nil
-	}
-	return ss.probeLimiter.Wait(ss.ctx)
-}
-
 // GetDevName Get the device name after the route selection
 func (ss *SynScanner) GetDevName() string {
 	return ss.devName
@@ -426,30 +411,17 @@ func (ss *SynScanner) portProbeHandle() {
 			ss.emitResult(openIpPort)
 			ss.portProbeWg.Done()
 		} else {
-			if !ss.acquireProbe() {
-				ss.portProbeWg.Done()
-				return
-			}
 			go func(_openIpPort port.OpenIpPort) {
 				defer func() {
-					ss.releaseProbe()
 					ss.portProbeWg.Done()
 				}()
 				if _openIpPort.Port != 0 {
 					// openPortChan already carries a confirmed open port; probe failures only skip enrichment.
 					fingerTimeout := ss.option.FingerTimeoutDuration()
 					if _openIpPort.FingerPrint {
-						if err := ss.WaitProbeLimiter(); err != nil {
-							ss.emitResult(_openIpPort)
-							return
-						}
 						_openIpPort.Service, _openIpPort.Banner, _ = fingerprint.PortIdentify("tcp", _openIpPort.Ip, _openIpPort.Port, fingerTimeout)
 					}
 					if _openIpPort.Httpx && (_openIpPort.Service == "" || _openIpPort.Service == "http" || _openIpPort.Service == "https") {
-						if err := ss.WaitProbeLimiter(); err != nil {
-							ss.emitResult(_openIpPort)
-							return
-						}
 						_openIpPort.HttpInfo, _openIpPort.Banner, _ = fingerprint.ProbeHttpInfo(_openIpPort.Ip.String(), _openIpPort.Port, _openIpPort.Service, fingerTimeout)
 						if _openIpPort.HttpInfo != nil {
 							if strings.HasPrefix(_openIpPort.HttpInfo.Url, "https") {
@@ -789,23 +761,6 @@ func (ss *SynScanner) recv() {
 		}
 	}
 }
-
-func (ss *SynScanner) acquireProbe() bool {
-	select {
-	case ss.probe <- struct{}{}:
-		return true
-	case <-ss.ctx.Done():
-		return false
-	}
-}
-
-func (ss *SynScanner) releaseProbe() {
-	select {
-	case <-ss.probe:
-	default:
-	}
-}
-
 func (ss *SynScanner) enqueueOpenPort(openIpPort port.OpenIpPort) bool {
 	select {
 	case <-ss.ctx.Done():
