@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // ref:https://github.com/EdgeSecurityTeam/EHole/blob/main/finger.json
@@ -29,6 +30,7 @@ type WebFinger struct {
 var WebFingers []WebFinger
 
 var onceLoadFingers sync.Once
+var loadedWebFingers atomic.Value
 
 //go:embed finger.json
 var DefFingerData []byte
@@ -47,36 +49,64 @@ func LoadWebFingerData(file string) error {
 }
 
 func ParseWebFingerData(data []byte) error {
-	err := json.Unmarshal(data, &WebFingers)
+	var parsed []WebFinger
+	err := json.Unmarshal(data, &parsed)
 	if err != nil {
 		return err
 	}
+	normalizeWebFingers(parsed)
+	WebFingers = parsed
+	loadedWebFingers.Store(parsed)
 	return nil
+}
+
+func normalizeWebFingers(fingers []WebFinger) {
+	for i := range fingers {
+		for j := range fingers[i].Fingers {
+			if fingers[i].Fingers[j].Location != "header" {
+				continue
+			}
+			for k := range fingers[i].Fingers[j].Keyword {
+				fingers[i].Fingers[j].Keyword[k] = strings.ToLower(fingers[i].Fingers[j].Keyword[k])
+			}
+		}
+	}
+}
+
+func getWebFingers() []WebFinger {
+	v := loadedWebFingers.Load()
+	if v == nil {
+		return nil
+	}
+	return v.([]WebFinger)
+}
+
+func ensureWebFingersLoaded() {
+	onceLoadFingers.Do(func() {
+		if len(getWebFingers()) == 0 {
+			_ = ParseWebFingerData(DefFingerData)
+		}
+	})
 }
 
 // WebFingerIdent web系统指纹识别
 func WebFingerIdent(resp *http.Response) (names []string) {
-	onceLoadFingers.Do(func() {
-		if len(WebFingers) == 0 {
-			ParseWebFingerData(DefFingerData)
-		}
-	})
+	ensureWebFingersLoaded()
+	webFingers := getWebFingers()
+	if len(webFingers) == 0 {
+		return nil
+	}
 	var dataMap = make(map[string]string)
 	body, _ := io.ReadAll(resp.Body)
 	dataMap["body"] = string(body)
 	var b bytes.Buffer
 	resp.Header.Write(&b)
 	dataMap["header"] = strings.ToLower(b.String())
-	for _, finger := range WebFingers {
+	for _, finger := range webFingers {
 		for _, finger2 := range finger.Fingers {
 			var flag bool
 			if _, ok := dataMap[finger2.Location]; !ok {
 				continue
-			}
-			if finger2.Location == "header" {
-				for i := 0; i < len(finger2.Keyword); i++ {
-					finger2.Keyword[i] = strings.ToLower(finger2.Keyword[i])
-				}
 			}
 			switch finger2.Method {
 			case "keyword":
@@ -102,7 +132,12 @@ func WebFingerIdent(resp *http.Response) (names []string) {
 
 // WebFingerIdentByFavicon web系统指纹识别,通过Favicon.ico
 func WebFingerIdentByFavicon(hash string) (names []string) {
-	for _, finger := range WebFingers {
+	ensureWebFingersLoaded()
+	webFingers := getWebFingers()
+	if len(webFingers) == 0 {
+		return nil
+	}
+	for _, finger := range webFingers {
 		for _, finger2 := range finger.Fingers {
 			switch finger2.Method {
 			case "faviconhash":

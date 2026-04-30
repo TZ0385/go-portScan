@@ -1,6 +1,9 @@
 package fingerprint
 
-import "regexp"
+import (
+	"regexp"
+	"sort"
+)
 
 // port fingerprint def
 // ref https://raw.githubusercontent.com/nmap/nmap/master/nmap-service-probes
@@ -10,6 +13,8 @@ import "regexp"
 var serviceOrder = []string{"http", "https", "ssh", "redis", "mysql"}
 
 var onlyRecv []string
+
+var serviceRuleOrder []string
 
 // 一组数据流，仅一次发送
 var groupFlows = map[string][]string{
@@ -408,4 +413,9 @@ func init() {
 			onlyRecv = append(onlyRecv, k)
 		}
 	}
+	serviceRuleOrder = make([]string, 0, len(serviceRules))
+	for service := range serviceRules {
+		serviceRuleOrder = append(serviceRuleOrder, service)
+	}
+	sort.Strings(serviceRuleOrder)
 }

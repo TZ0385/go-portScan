@@ -15,7 +15,25 @@ var ErrOverflow = errors.New("OverflowMax")
 
 var DefHttpClient *http.Client
 
+func normalizeDialTimeout(dialTimeout time.Duration) time.Duration {
+	if dialTimeout <= 0 {
+		return 3 * time.Second
+	}
+	return dialTimeout
+}
+
+func normalizeHTTPTimeout(dialTimeout time.Duration) time.Duration {
+	dialTimeout = normalizeDialTimeout(dialTimeout)
+	timeout := dialTimeout*2 + time.Second
+	if timeout < 3*time.Second {
+		return 3 * time.Second
+	}
+	return timeout
+}
+
 func NewHttpClient(dialTimeout time.Duration) *http.Client {
+	dialTimeout = normalizeDialTimeout(dialTimeout)
+	requestTimeout := normalizeHTTPTimeout(dialTimeout)
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -26,8 +44,9 @@ func NewHttpClient(dialTimeout time.Duration) *http.Client {
 		}).DialContext,
 		MaxIdleConnsPerHost:   1,
 		IdleConnTimeout:       100 * time.Millisecond,
-		TLSHandshakeTimeout:   3 * time.Second,
-		ExpectContinueTimeout: 3 * time.Second,
+		TLSHandshakeTimeout:   requestTimeout,
+		ResponseHeaderTimeout: requestTimeout,
+		ExpectContinueTimeout: time.Second,
 		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 		Proxy:                 http.ProxyFromEnvironment,
@@ -43,7 +62,7 @@ func NewHttpClient(dialTimeout time.Duration) *http.Client {
 	//}
 
 	return &http.Client{
-		Timeout:   3 * time.Second,
+		Timeout:   requestTimeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -56,16 +75,23 @@ func GetBody(resp *http.Response) (body []byte, err error) {
 	if resp.Body == nil || resp.Body == http.NoBody {
 		return
 	}
+	defer resp.Body.Close()
 	var reader io.Reader
+	var readerCloser io.ReadCloser
 	switch resp.Header.Get("Content-Encoding") {
 	case "gzip":
-		reader, err = gzip.NewReader(resp.Body)
+		readerCloser, err = gzip.NewReader(resp.Body)
+		reader = readerCloser
 	case "deflate":
-		reader = flate.NewReader(resp.Body)
+		readerCloser = flate.NewReader(resp.Body)
+		reader = readerCloser
 	//case "br":
 	//	reader = brotli.NewReader(resp.Body)
 	default:
 		reader = resp.Body
+	}
+	if readerCloser != nil {
+		defer readerCloser.Close()
 	}
 	if err == nil {
 		resp.Header.Del("Content-Encoding")

@@ -3,25 +3,39 @@ package fingerprint
 import (
 	"bytes"
 	_ "embed"
+	"errors"
 	"fmt"
-	"github.com/XinRoom/go-portScan/core/port"
-	"github.com/XinRoom/go-portScan/core/port/fingerprint/webfinger"
-	"github.com/XinRoom/go-portScan/util"
-	"github.com/XinRoom/go-portScan/util/httputil"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/XinRoom/go-portScan/core/port"
+	"github.com/XinRoom/go-portScan/core/port/fingerprint/webfinger"
+	"github.com/XinRoom/go-portScan/util"
+	"github.com/XinRoom/go-portScan/util/httputil"
 )
 
 var httpsTopPort = []uint16{443, 4443, 1443, 8443}
 
-var httpClient *http.Client
+var httpClients sync.Map
 
-func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDailErr bool) {
+func getHTTPClient(dialTimeout time.Duration) *http.Client {
+	if v, ok := httpClients.Load(dialTimeout); ok {
+		return v.(*http.Client)
+	}
+	// Keep one client per timeout bucket so short and long probes do not trample each other's budgets.
+	client := httputil.NewHttpClient(dialTimeout)
+	actual, _ := httpClients.LoadOrStore(dialTimeout, client)
+	return actual.(*http.Client)
+}
+
+func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
 	var schemes []string
 
 	if util.IsUint16InList(_port, httpsTopPort) || topScheme == "https" {
@@ -37,8 +51,8 @@ func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time
 
 		var httpInfo2 *port.HttpInfo
 		var banner2 []byte
-		httpInfo2, banner2, isDailErr = WebHttpInfo(url2, dialTimeout, true)
-		if isDailErr {
+		httpInfo2, banner2, isDialErr = WebHttpInfo(url2, dialTimeout, true)
+		if isDialErr {
 			return
 		}
 
@@ -54,10 +68,8 @@ func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time
 	return
 }
 
-func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo *port.HttpInfo, banner []byte, isDailErr bool) {
-	if httpClient == nil {
-		httpClient = httputil.NewHttpClient(dialTimeout)
-	}
+func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
+	httpClient := getHTTPClient(dialTimeout)
 
 	var err error
 	var body []byte
@@ -66,9 +78,9 @@ func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo
 	var b bytes.Buffer
 	defer b.Reset()
 
-	resps, body, err = getReq(url2, 1)
+	resps, body, err = getReq(httpClient, url2, 1)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "timeout") || strings.Contains(err.Error(), refusedStr) {
+		if isDialOrTimeoutErr(err) {
 			return nil, banner, true
 		}
 	}
@@ -110,13 +122,13 @@ func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo
 		if favicon {
 			fau := webfinger.FindFaviconUrl(string(banner))
 			if fau == "" {
-				resp.Request.URL.Path = "/favicon.ico"
-				fau = resp.Request.URL.String()
+				fau = "/favicon.ico"
 			}
-			if !strings.HasPrefix(fau, "http") {
-				fau = resp.Request.URL.String() + fau
+			faviconURL, err := resolveURL(resp.Request.URL, fau)
+			if err != nil {
+				return
 			}
-			resps2, body2, err2 := getReq(fau, 0)
+			resps2, body2, err2 := getReq(httpClient, faviconURL, 0)
 			if err2 == nil && len(body2) != 0 && len(resps2) > 0 && resps2[0].StatusCode == 200 && strings.Contains(resps2[0].Header.Get("Content-Type"), "image") {
 				httpInfo.Favicon = body2
 				httpInfo.FaviconHash = webfinger.WebFaviconHash(body2)
@@ -127,7 +139,35 @@ func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo
 	return
 }
 
-func getReq(url2 string, maxRewriteNum int) (resps []*http.Response, body []byte, err error) {
+func isDialOrTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	// Probe callers treat connect/timeout failures as "enrichment unavailable" and preserve the open port.
+	errText := strings.ToLower(err.Error())
+	return (errors.As(err, &netErr) && netErr.Timeout()) ||
+		strings.Contains(errText, "timeout") ||
+		strings.Contains(errText, refusedStr)
+}
+
+func resolveURL(base *url.URL, rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	return base.ResolveReference(u).String(), nil
+}
+
+func traceRemoteHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host
+	}
+	return addr
+}
+
+func getReq(httpClient *http.Client, url2 string, maxRewriteNum int) (resps []*http.Response, body []byte, err error) {
 	var rewriteNum int
 	var req *http.Request
 	for {
@@ -135,7 +175,7 @@ func getReq(url2 string, maxRewriteNum int) (resps []*http.Response, body []byte
 		var connectAddr string
 		trace := &httptrace.ClientTrace{
 			ConnectStart: func(net, addr string) {
-				connectAddr = strings.Split(addr, ":")[0]
+				connectAddr = traceRemoteHost(addr)
 			},
 		}
 		req, err = http.NewRequest(http.MethodGet, url2, http.NoBody)
@@ -156,16 +196,19 @@ func getReq(url2 string, maxRewriteNum int) (resps []*http.Response, body []byte
 		resp.Request.RemoteAddr = connectAddr
 		resps = append(resps, resp)
 		if resp.Body != http.NoBody && resp.Body != nil {
-			body, _ = httputil.GetBody(resp)
+			body, err = httputil.GetBody(resp)
+			if err != nil && err != httputil.ErrOverflow {
+				return
+			}
 			if contentTypes, _ := resp.Header["Content-Type"]; len(contentTypes) > 0 {
 				if strings.Contains(contentTypes[0], "text") {
 					_body, err2 := DecodeData(body, resp.Header)
 					if err2 == nil {
 						body = _body
 					}
-					resp.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		if resp.ContentLength == -1 {
 			resp.ContentLength = int64(len(body))

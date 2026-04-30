@@ -44,8 +44,36 @@ var readBufPool = &sync.Pool{
 	},
 }
 
+func identifyBudget(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 2 * time.Second
+	}
+	// Fingerprint matching may need several protocol attempts; cap the total wall time instead of
+	// reusing the full timeout on every rule.
+	budget := timeout * 4
+	if budget < 2*time.Second {
+		return 2 * time.Second
+	}
+	if budget > 8*time.Second {
+		return 8 * time.Second
+	}
+	return budget
+}
+
+func remainingTimeout(deadline time.Time, timeout time.Duration) (time.Duration, bool) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, false
+	}
+	if timeout <= 0 || remaining < timeout {
+		return remaining, true
+	}
+	return timeout, true
+}
+
 // PortIdentify 端口识别
-func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDailErr bool) {
+func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDialErr bool) {
+	deadline := time.Now().Add(identifyBudget(dailTimeout))
 
 	matchedRule := make(map[string]struct{})
 	// 记录对应服务已经进行过匹配
@@ -63,11 +91,15 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 
 	defer func() {
 		if sn == "http" && bytes.HasPrefix(banner, []byte("HTTP/1.1 400")) {
-			sn2, banner2, isDailErr2 := matchRule(network, ip, _port, "https", dailTimeout)
-			if !isDailErr && sn2 != "" {
+			attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
+			if !ok {
+				return
+			}
+			sn2, banner2, isDialErr2 := matchRule(network, ip, _port, "https", attemptTimeout)
+			if !isDialErr && sn2 != "" {
 				sn = sn2
 				banner = banner2
-				isDailErr = isDailErr2
+				isDialErr = isDialErr2
 			}
 		}
 	}()
@@ -75,12 +107,16 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 	// 优先判断port可能的服务
 	if serviceNames, ok := portServiceOrder[_port]; ok {
 		for _, service := range serviceNames {
+			attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
+			if !ok {
+				return unknown, banner, false
+			}
 			recordMatched(service)
-			sn, banner, isDailErr = matchRule(network, ip, _port, service, dailTimeout)
+			sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
 			if sn != "" {
 				return sn, banner, false
-			} else if isDailErr {
-				return unknown, banner, isDailErr
+			} else if isDialErr {
+				return unknown, banner, isDialErr
 			}
 		}
 	}
@@ -97,18 +133,27 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		}()
 		address := net.JoinHostPort(ip.String(), strconv.Itoa(int(_port)))
 		now := time.Now()
-		conn, _ = net.DialTimeout(network, address, dailTimeout)
+		attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
+		if !ok {
+			return unknown, banner, false
+		}
+		conn, _ = net.DialTimeout(network, address, attemptTimeout)
 		if conn == nil {
 			return unknown, banner, true
 		}
 		lastDailTime = time.Since(now) * 2
-		if lastDailTime < dailTimeout {
+		if lastDailTime < dailTimeout || dailTimeout <= 0 {
 			dailTimeout = lastDailTime
 			if dailTimeout < 250*time.Millisecond {
 				dailTimeout = 250 * time.Millisecond
 			}
 		}
-		n, _ = read(conn, buf, dailTimeout)
+		attemptTimeout, ok = remainingTimeout(deadline, dailTimeout)
+		if !ok {
+			conn.Close()
+			return unknown, banner, false
+		}
+		n, _ = read(conn, buf, attemptTimeout)
 		conn.Close()
 		if n != 0 {
 			banner = make([]byte, n)
@@ -137,25 +182,33 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		if ok {
 			continue
 		}
+		attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
+		if !ok {
+			return unknown, banner, false
+		}
 		recordMatched(service)
-		sn, banner, isDailErr = matchRule(network, ip, _port, service, dailTimeout)
+		sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
 		if sn != "" {
 			return sn, banner, false
-		} else if isDailErr {
+		} else if isDialErr {
 			return unknown, banner, true
 		}
 	}
 
 	// other
-	for service := range serviceRules {
+	for _, service := range serviceRuleOrder {
 		_, ok := matchedRule[service]
 		if ok {
 			continue
 		}
-		sn, banner, isDailErr = matchRule(network, ip, _port, service, dailTimeout)
+		attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
+		if !ok {
+			return unknown, banner, false
+		}
+		sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
 		if sn != "" {
 			return sn, banner, false
-		} else if isDailErr {
+		} else if isDialErr {
 			return unknown, banner, true
 		}
 	}
@@ -187,7 +240,7 @@ func matchRuleWhithBuf(buf, ip net.IP, _port uint16, rule ruleData) bool {
 }
 
 // 指纹匹配函数
-func matchRule(network string, ip net.IP, _port uint16, serviceName string, dailTimeout time.Duration) (serviceNameRet string, banner []byte, isDailErr bool) {
+func matchRule(network string, ip net.IP, _port uint16, serviceName string, dailTimeout time.Duration) (serviceNameRet string, banner []byte, isDialErr bool) {
 	var err error
 	var isTls bool
 	var conn net.Conn
@@ -207,7 +260,7 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 		})
 		if err != nil {
 			if strings.HasSuffix(err.Error(), ioTimeoutStr) || strings.Contains(err.Error(), refusedStr) {
-				isDailErr = true
+				isDialErr = true
 				return
 			}
 			var oe *net.OpError
@@ -221,7 +274,7 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 	} else {
 		conn, err = net.DialTimeout(network, address, dailTimeout)
 		if conn == nil {
-			isDailErr = true
+			isDialErr = true
 			return
 		}
 		defer conn.Close()
