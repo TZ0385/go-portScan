@@ -20,17 +20,22 @@ var DefaultTcpOption = port.ScannerOption{
 	FingerTimeout: 2000,
 }
 
+type hostLimiter interface {
+	Wait(context.Context, string) error
+}
+
 type TcpScanner struct {
-	ports     []uint16             // 指定端口
-	retChan   chan port.OpenIpPort // 返回值队列
-	limiter   *limiter.Limiter
-	ctx       context.Context
-	cancel    context.CancelFunc
-	timeout   time.Duration
-	isDone    atomic.Bool
-	option    port.ScannerOption
-	wg        sync.WaitGroup
-	closeOnce sync.Once
+	ports       []uint16             // 指定端口
+	retChan     chan port.OpenIpPort // 返回值队列
+	limiter     *limiter.Limiter
+	hostLimiter hostLimiter
+	ctx         context.Context
+	cancel      context.CancelFunc
+	timeout     time.Duration
+	isDone      atomic.Bool
+	option      port.ScannerOption
+	wg          sync.WaitGroup
+	closeOnce   sync.Once
 }
 
 // NewTcpScanner Tcp扫描器
@@ -47,12 +52,13 @@ func NewTcpScanner(retChan chan port.OpenIpPort, option port.ScannerOption) (ts 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ts = &TcpScanner{
-		retChan: retChan,
-		limiter: limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
-		ctx:     ctx,
-		cancel:  cancel,
-		timeout: time.Duration(option.Timeout) * time.Millisecond,
-		option:  option,
+		retChan:     retChan,
+		limiter:     limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
+		hostLimiter: newHostLimiter(option.RatePreHost),
+		ctx:         ctx,
+		cancel:      cancel,
+		timeout:     time.Duration(option.Timeout) * time.Millisecond,
+		option:      option,
 	}
 
 	return
@@ -62,6 +68,13 @@ func NewTcpScanner(retChan chan port.OpenIpPort, option port.ScannerOption) (ts 
 func (ts *TcpScanner) Scan(ip net.IP, dst uint16, ipOption port.IpOption) error {
 	if ts.isDone.Load() {
 		return errors.New("scanner is closed")
+	}
+	if err := ts.waitHostLimiter(ip); err != nil {
+		return err
+	}
+	// wait 返回后仍可能已经被 Close/cancel，这里要在启动 goroutine 前再次拦截。
+	if err := ts.ctx.Err(); err != nil {
+		return err
 	}
 	ts.wg.Add(1)
 	go func() {
@@ -137,6 +150,13 @@ func (ts *TcpScanner) WaitLimiter() error {
 	return ts.limiter.Wait(ts.ctx)
 }
 
+func (ts *TcpScanner) waitHostLimiter(ip net.IP) error {
+	if ts.hostLimiter == nil || ip == nil {
+		return nil
+	}
+	return ts.hostLimiter.Wait(ts.ctx, ip.String())
+}
+
 func (ts *TcpScanner) emitResult(openIpPort port.OpenIpPort) bool {
 	select {
 	case <-ts.ctx.Done():
@@ -145,4 +165,8 @@ func (ts *TcpScanner) emitResult(openIpPort port.OpenIpPort) bool {
 	case ts.retChan <- openIpPort:
 		return true
 	}
+}
+
+func newHostLimiter(ratePerHost int) hostLimiter {
+	return port.NewHostLimiterStore(ratePerHost)
 }

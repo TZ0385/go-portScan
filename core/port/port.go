@@ -156,9 +156,10 @@ func (op OpenIpPort) Json() string {
 
 // ScannerOption 扫描器初始化参数
 type ScannerOption struct {
-	Rate     int // 每秒速度限制, 单位: s, 会在1s内平均发送, 相当于每个包之间的延迟
-	MiniRate int // 最小每秒速度，避免自动调速太低, 单位: s,  0为不设置
-	Timeout  int // TCP连接响应延迟, 单位: ms
+	Rate        int // 每秒速度限制, 单位: s, 会在1s内平均发送, 相当于每个包之间的延迟
+	RatePreHost int // 单个 host 每秒速度限制, 0 为不限制
+	MiniRate    int // 最小每秒速度，避免自动调速太低, 单位: s,  0为不设置
+	Timeout     int // TCP连接响应延迟, 单位: ms
 	// FingerTimeout controls active service/http fingerprint probes, in ms.
 	FingerTimeout int
 	NextHop       string // pcap dev name

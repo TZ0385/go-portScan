@@ -29,6 +29,7 @@ var (
 	pt          bool
 	sT          bool
 	rate        int
+	ratePreHost int
 	miniRate    int
 	sV          bool
 	timeout     int
@@ -57,6 +58,7 @@ func parseFlag(c *cli.Context) {
 	hostGroup = c.Int("hostGroup")
 	pt = c.Bool("PT")
 	rate = c.Int("rate")
+	ratePreHost = c.Int("ratePreHost")
 	miniRate = c.Int("miniRate")
 	sT = c.Bool("sT")
 	sV = c.Bool("sV")
@@ -227,13 +229,7 @@ func run(c *cli.Context) error {
 
 	// Initialize the Scanner
 	var s port.Scanner
-	option := port.ScannerOption{
-		Rate:     rate,
-		MiniRate: miniRate,
-		Timeout:  timeout,
-		NextHop:  nexthop,
-		Debug:    debug,
-	}
+	option := scannerOptionFromFlags()
 	ipOption := port.IpOption{
 		FingerPrint: sV,
 		Httpx:       httpx,
@@ -339,6 +335,17 @@ func run(c *cli.Context) error {
 	return nil
 }
 
+func scannerOptionFromFlags() port.ScannerOption {
+	return port.ScannerOption{
+		Rate:        rate,
+		RatePreHost: ratePreHost,
+		MiniRate:    miniRate,
+		Timeout:     timeout,
+		NextHop:     nexthop,
+		Debug:       debug,
+	}
+}
+
 func main() {
 	app := &cli.App{
 		Name:        "PortScan",
@@ -412,6 +419,12 @@ func main() {
 				Aliases: []string{"r"},
 				Usage:   fmt.Sprintf("number of packets sent per second. If set -1, TCP-mode is %d, SYN-mode is %d(SYN-mode is restricted by the network adapter, 2000=1M)", tcp.DefaultTcpOption.Rate, syn.DefaultSynOption.Rate),
 				Value:   -1,
+			},
+			&cli.IntFlag{
+				Name:    "ratePreHost",
+				Aliases: []string{"rph"},
+				Usage:   "per-host port scan rate limit, 0 disables the limit",
+				Value:   0,
 			},
 			&cli.IntFlag{
 				Name:    "miniRate",

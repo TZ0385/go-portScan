@@ -21,6 +21,10 @@ import (
 	"time"
 )
 
+type hostLimiter interface {
+	Wait(context.Context, string) error
+}
+
 type SynScanner struct {
 	srcMac, gwMac net.HardwareAddr // macAddr
 	devName       string           // eth dev(pcap)
@@ -43,6 +47,7 @@ type SynScanner struct {
 	portProbeWg    sync.WaitGroup
 	retChan        chan port.OpenIpPort // results chan
 	limiter        *limiter.Limiter
+	hostLimiter    hostLimiter
 	ctx            context.Context
 	cancel         context.CancelFunc
 	watchIpStatusT *watchIpStatusTable // IpStatusCacheTable
@@ -110,6 +115,7 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		openPortChan:   make(chan port.OpenIpPort, cap(retChan)),
 		retChan:        retChan,
 		limiter:        limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
+		hostLimiter:    newHostLimiter(option.RatePreHost),
 		ctx:            ctx,
 		cancel:         cancel,
 		watchIpStatusT: newWatchIpStatusTable(time.Duration(option.Timeout) * time.Millisecond),
@@ -155,6 +161,13 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (err error) {
 	if ss.isDone.Load() {
 		return io.EOF
+	}
+	if err = ss.waitHostLimiter(dstIp); err != nil {
+		return err
+	}
+	// wait 返回后仍可能已经被 Close/cancel，这里要在后续状态变更前再次拦截。
+	if err = ss.ctx.Err(); err != nil {
+		return err
 	}
 
 	ss.changeLimiter()
@@ -327,6 +340,13 @@ func (ss *SynScanner) WaitLimiter() error {
 	return ss.limiter.Wait(ss.ctx)
 }
 
+func (ss *SynScanner) waitHostLimiter(ip net.IP) error {
+	if ss.hostLimiter == nil || ip == nil {
+		return nil
+	}
+	return ss.hostLimiter.Wait(ss.ctx, ip.String())
+}
+
 // GetDevName Get the device name after the route selection
 func (ss *SynScanner) GetDevName() string {
 	return ss.devName
@@ -402,6 +422,10 @@ func (ss *SynScanner) changeLimiter() {
 			}
 		}
 	}
+}
+
+func newHostLimiter(ratePerHost int) hostLimiter {
+	return port.NewHostLimiterStore(ratePerHost)
 }
 
 func (ss *SynScanner) portProbeHandle() {
@@ -480,6 +504,9 @@ func (ss *SynScanner) getHwAddrV4(arpDst net.IP) (mac net.HardwareAddr, err erro
 	var retry int
 
 	for {
+		if err = ss.ctx.Err(); err != nil {
+			return nil, err
+		}
 		mac = ss.watchMacCacheT.GetMac(ipStr)
 		if mac != nil {
 			return mac, nil
@@ -568,6 +595,9 @@ func (ss *SynScanner) getHwAddrV6(arpDst net.IP) (mac net.HardwareAddr, err erro
 	var retry int
 
 	for {
+		if err = ss.ctx.Err(); err != nil {
+			return nil, err
+		}
 		mac = ss.watchMacCacheT.GetMac(ipStr)
 		if mac != nil {
 			return mac, nil

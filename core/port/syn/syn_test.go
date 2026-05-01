@@ -1,6 +1,8 @@
 package syn
 
 import (
+	"context"
+	"errors"
 	"github.com/XinRoom/go-portScan/core/host"
 	"github.com/XinRoom/go-portScan/core/port"
 	"github.com/XinRoom/iprange"
@@ -12,6 +14,159 @@ import (
 	"testing"
 	"time"
 )
+
+type cancelOnWaitHostLimiter struct {
+	cancel context.CancelFunc
+}
+
+func (l *cancelOnWaitHostLimiter) Wait(_ context.Context, _ string) error {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	return nil
+}
+
+func TestSynScannerWaitHostLimiterIsCanceledByClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ss := &SynScanner{
+		ctx:          ctx,
+		cancel:       cancel,
+		hostLimiter:  newHostLimiter(1),
+		openPortChan: make(chan port.OpenIpPort, 1),
+		retChan:      make(chan port.OpenIpPort, 1),
+	}
+
+	if err := ss.waitHostLimiter(net.ParseIP("127.0.0.1")); err != nil {
+		t.Fatalf("expected first same-host wait to pass, got %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- ss.waitHostLimiter(net.ParseIP("127.0.0.1"))
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("expected second same-host wait to block before close, got %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	ss.Close()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected close to cancel blocked same-host wait")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected blocked same-host wait to exit after close")
+	}
+}
+
+func TestSynScannerScanBlocksOnHostLimiterUntilClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ss := &SynScanner{
+		ctx:            ctx,
+		cancel:         cancel,
+		hostLimiter:    newHostLimiter(1),
+		watchIpStatusT: newWatchIpStatusTable(time.Second),
+		openPortChan:   make(chan port.OpenIpPort, 1),
+		retChan:        make(chan port.OpenIpPort, 1),
+	}
+	t.Cleanup(ss.Close)
+
+	ip := net.ParseIP("127.0.0.1")
+	if err := ss.waitHostLimiter(ip); err != nil {
+		t.Fatalf("expected first same-host wait to pass, got %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- ss.Scan(ip, 80, port.IpOption{})
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("expected Scan to block on same-host limiter before close, got %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	if !ss.watchIpStatusT.IsEmpty() {
+		t.Fatal("expected blocked Scan to stop before watch state is updated")
+	}
+
+	ss.Close()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("expected Close to cancel blocked Scan")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected blocked Scan to exit after close")
+	}
+
+	if !ss.watchIpStatusT.IsEmpty() {
+		t.Fatal("expected canceled Scan to exit before packet preparation state changes")
+	}
+}
+
+func TestSynScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ip := net.ParseIP("127.0.0.1")
+	watchIpStatusT := newWatchIpStatusTable(time.Second)
+	watchMacCacheT := newWatchMacCacheTable()
+	watchMacCacheT.UpdateLastTime(ip.String())
+
+	ss := &SynScanner{
+		ctx:            ctx,
+		hostLimiter:    &cancelOnWaitHostLimiter{cancel: cancel},
+		watchIpStatusT: watchIpStatusT,
+		watchMacCacheT: watchMacCacheT,
+		openPortChan:   make(chan port.OpenIpPort, 1),
+		retChan:        make(chan port.OpenIpPort, 1),
+		cancel:         cancel,
+	}
+	t.Cleanup(ss.Close)
+
+	err := ss.Scan(ip, 80, port.IpOption{FingerPrint: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+	if !watchIpStatusT.IsEmpty() {
+		t.Fatal("expected canceled Scan to stop before watch state is updated")
+	}
+}
+
+func TestSynScannerGetHwAddrV6StopsWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ss := &SynScanner{
+		ctx:            ctx,
+		cancel:         cancel,
+		watchMacCacheT: newWatchMacCacheTable(),
+		openPortChan:   make(chan port.OpenIpPort),
+		retChan:        make(chan port.OpenIpPort),
+	}
+	t.Cleanup(ss.Close)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := ss.getHwAddrV6(net.ParseIP("2001:db8::1"))
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation error, got %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected getHwAddrV6 to stop promptly after context cancellation")
+	}
+}
 
 func TestSynScannerScanIntegration(t *testing.T) {
 	if os.Getenv("GO_PORTSCAN_RUN_SYN_INTEGRATION") != "1" {
