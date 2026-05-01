@@ -63,6 +63,28 @@ func TestSynScannerWaitHostLimiterIsCanceledByClose(t *testing.T) {
 	}
 }
 
+func TestSynScannerCloseDoesNotCloseResultChannel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	retChan := make(chan port.OpenIpPort, 1)
+	ss := &SynScanner{
+		ctx:          ctx,
+		cancel:       cancel,
+		openPortChan: make(chan port.OpenIpPort, 1),
+		retChan:      retChan,
+	}
+
+	ss.Close()
+
+	select {
+	case _, ok := <-retChan:
+		if !ok {
+			t.Fatal("expected caller-owned result channel to remain open")
+		}
+	default:
+	}
+	close(retChan)
+}
+
 func TestSynScannerScanBlocksOnHostLimiterUntilClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ss := &SynScanner{

@@ -132,16 +132,15 @@ func (ts *TcpScanner) Wait() {
 	ts.wg.Wait()
 }
 
-// Close chan
+// Close scanner resources. The caller owns retChan lifecycle.
 func (ts *TcpScanner) Close() {
 	ts.closeOnce.Do(func() {
 		ts.isDone.Store(true)
 		if ts.cancel != nil {
 			ts.cancel()
 		}
-		// Wait for in-flight scans to stop touching retChan before closing it.
+		// Wait for in-flight scans to stop touching retChan before returning.
 		ts.wg.Wait()
-		close(ts.retChan)
 	})
 }
 

@@ -122,6 +122,28 @@ func TestTcpScannerCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTcpScannerCloseDoesNotCloseResultChannel(t *testing.T) {
+	retChan := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{
+		Rate:    100,
+		Timeout: 200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner.Close()
+
+	select {
+	case _, ok := <-retChan:
+		if !ok {
+			t.Fatal("expected caller-owned result channel to remain open")
+		}
+	default:
+	}
+	close(retChan)
+}
+
 func TestTcpScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T) {
 	retChan := make(chan port.OpenIpPort, 1)
 	scanner, err := NewTcpScanner(retChan, port.ScannerOption{

@@ -281,7 +281,7 @@ func (ss *SynScanner) Wait() {
 	ss.portProbeWg.Wait()
 }
 
-// Close cleans up the handle and chan.
+// Close cleans up scanner-owned resources. The caller owns retChan lifecycle.
 func (ss *SynScanner) Close() {
 	ss.closeOnce.Do(func() {
 		ss.isDone.Store(true)
@@ -331,7 +331,6 @@ func (ss *SynScanner) Close() {
 		// portProbeHandle drains openPortChan and owns all probe workers.
 		ss.probeLoopWg.Wait()
 		ss.portProbeWg.Wait()
-		close(ss.retChan)
 	})
 }
 

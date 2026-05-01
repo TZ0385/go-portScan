@@ -330,6 +330,7 @@ func run(c *cli.Context) error {
 	wgHostScan.Wait() // HostGroupS
 	s.Wait()          // 扫描器-等
 	s.Close()         // 扫描器-收
+	close(retChan)    // 结果通道由调用方统一收尾
 	<-single          // 接收器-收
 	myLog.Printf("[*] elapsed time: %s\n", time.Since(start))
 	return nil
