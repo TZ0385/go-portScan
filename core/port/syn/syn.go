@@ -427,6 +427,13 @@ func newHostLimiter(ratePerHost int) hostLimiter {
 	return port.NewHostLimiterStore(ratePerHost)
 }
 
+func (ss *SynScanner) macResolveTimeout() time.Duration {
+	if ss.option.Timeout > 0 {
+		return time.Duration(ss.option.Timeout) * time.Millisecond
+	}
+	return 600 * time.Millisecond
+}
+
 func (ss *SynScanner) portProbeHandle() {
 	for openIpPort := range ss.openPortChan {
 		ss.portProbeWg.Add(1)
@@ -500,6 +507,7 @@ func (ss *SynScanner) getHwAddrV4(arpDst net.IP) (mac net.HardwareAddr, err erro
 	}
 
 	start := time.Now()
+	timeout := ss.macResolveTimeout()
 	var retry int
 
 	for {
@@ -511,7 +519,7 @@ func (ss *SynScanner) getHwAddrV4(arpDst net.IP) (mac net.HardwareAddr, err erro
 			return mac, nil
 		}
 		// Wait 600 ms for an ARP reply.
-		if time.Since(start) > time.Millisecond*600 {
+		if time.Since(start) > timeout {
 			return nil, errors.New("timeout getting ARP reply")
 		}
 		retry += 1
@@ -590,7 +598,8 @@ func (ss *SynScanner) getHwAddrV6(arpDst net.IP) (mac net.HardwareAddr, err erro
 
 	icmpv6.SetNetworkLayerForChecksum(&ipv6)
 
-	//start := time.Now()
+	start := time.Now()
+	timeout := ss.macResolveTimeout()
 	var retry int
 
 	for {
@@ -601,10 +610,9 @@ func (ss *SynScanner) getHwAddrV6(arpDst net.IP) (mac net.HardwareAddr, err erro
 		if mac != nil {
 			return mac, nil
 		}
-		// Wait 600 ms for an ARP reply.
-		//if time.Since(start) > time.Millisecond*600 {
-		//	return nil, errors.New("timeout getting ICMP V6 NA reply")
-		//}
+		if time.Since(start) > timeout {
+			return nil, errors.New("timeout getting ICMP V6 NA reply")
+		}
 		retry += 1
 		if retry%25 == 0 {
 			if err = ss.send(&eth, &ipv6, &icmpv6, &icmpv6Payload); err != nil {

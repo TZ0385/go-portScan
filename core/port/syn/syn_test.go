@@ -6,6 +6,7 @@ import (
 	"github.com/XinRoom/go-portScan/core/host"
 	"github.com/XinRoom/go-portScan/core/port"
 	"github.com/XinRoom/iprange"
+	"github.com/google/gopacket"
 	"github.com/panjf2000/ants/v2"
 	"log"
 	"net"
@@ -187,6 +188,35 @@ func TestSynScannerGetHwAddrV6StopsWhenContextCanceled(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("expected getHwAddrV6 to stop promptly after context cancellation")
+	}
+}
+
+func TestSynScannerGetHwAddrV6TimesOutWithoutNeighborReply(t *testing.T) {
+	ss := &SynScanner{
+		ctx:            context.Background(),
+		option:         port.ScannerOption{Timeout: 50},
+		srcMac:         net.HardwareAddr{0, 1, 2, 3, 4, 5},
+		srcIp:          net.ParseIP("fe80::1"),
+		watchMacCacheT: newWatchMacCacheTable(),
+		bufPool: &sync.Pool{New: func() interface{} {
+			return gopacket.NewSerializeBuffer()
+		}},
+	}
+	defer ss.watchMacCacheT.Close()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("expected timeout before send path panic, got panic: %v", r)
+		}
+	}()
+
+	start := time.Now()
+	_, err := ss.getHwAddrV6(net.ParseIP("2001:db8::1"))
+	if err == nil || err.Error() != "timeout getting ICMP V6 NA reply" {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected prompt timeout, got %s", elapsed)
 	}
 }
 
