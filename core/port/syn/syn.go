@@ -40,6 +40,8 @@ type SynScanner struct {
 
 	// Buffer复用
 	bufPool *sync.Pool
+	// sendPacket 仅用于测试中注入发送失败，生产默认走 send。
+	sendPacket func(...gopacket.SerializableLayer) error
 
 	//
 	option         port.ScannerOption
@@ -48,6 +50,7 @@ type SynScanner struct {
 	retChan        chan port.OpenIpPort // results chan
 	limiter        *limiter.Limiter
 	hostLimiter    hostLimiter
+	hostPacer      *port.HostPacerStore
 	ctx            context.Context
 	cancel         context.CancelFunc
 	watchIpStatusT *watchIpStatusTable // IpStatusCacheTable
@@ -116,11 +119,16 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		retChan:        retChan,
 		limiter:        limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
 		hostLimiter:    newHostLimiter(option.RatePreHost),
+		hostPacer:      port.NewHostPacerStore(option.RatePreHost, time.Minute, time.Now),
 		ctx:            ctx,
 		cancel:         cancel,
 		watchIpStatusT: newWatchIpStatusTable(time.Duration(option.Timeout) * time.Millisecond),
 		watchMacCacheT: newWatchMacCacheTable(),
 	}
+	if ss.hostPacer != nil {
+		ss.hostPacer.SetDebug(option.Debug, nil)
+	}
+	ss.sendPacket = ss.send
 	ss.probeLoopWg.Add(1)
 	go func() {
 		defer ss.probeLoopWg.Done()
@@ -163,6 +171,9 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 		return io.EOF
 	}
 	if err = ss.waitHostLimiter(dstIp); err != nil {
+		return err
+	}
+	if err = ss.waitHostPacer(dstIp); err != nil {
 		return err
 	}
 	// wait 返回后仍可能已经被 Close/cancel，这里要在后续状态变更前再次拦截。
@@ -257,10 +268,16 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 	// Send one packet per loop iteration until we've sent packets
 	if ip4 != nil {
 		tcp.SetNetworkLayerForChecksum(ip4)
-		ss.send(&eth, ip4, &tcp)
+		if err = ss.sendPacket(&eth, ip4, &tcp); err != nil {
+			return err
+		}
+		ss.watchIpStatusT.RecordSentPort(ipStr, dst, time.Now())
 	} else if ip6 != nil {
 		tcp.SetNetworkLayerForChecksum(ip6)
-		ss.send(&eth, ip6, &tcp)
+		if err = ss.sendPacket(&eth, ip6, &tcp); err != nil {
+			return err
+		}
+		ss.watchIpStatusT.RecordSentPort(ipStr, dst, time.Now())
 	}
 	return
 }
@@ -344,6 +361,20 @@ func (ss *SynScanner) waitHostLimiter(ip net.IP) error {
 		return nil
 	}
 	return ss.hostLimiter.Wait(ss.ctx, ip.String())
+}
+
+func (ss *SynScanner) waitHostPacer(ip net.IP) error {
+	if ss.hostPacer == nil || ip == nil {
+		return nil
+	}
+	return ss.hostPacer.Wait(ss.ctx, ip.String())
+}
+
+func (ss *SynScanner) observeHostSample(host string, sample port.HostSample) {
+	if ss.hostPacer == nil {
+		return
+	}
+	ss.hostPacer.Observe(host, sample)
 }
 
 // GetDevName Get the device name after the route selection
@@ -768,6 +799,9 @@ func (ss *SynScanner) recv() {
 					continue
 				} else {
 					ss.watchIpStatusT.RecordPort(ipStr, _port) // record
+					if sentAt, ok := ss.watchIpStatusT.TakeSentPortTime(ipStr, _port); ok {
+						ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(sentAt), HasRTT: true})
+					}
 				}
 			}
 

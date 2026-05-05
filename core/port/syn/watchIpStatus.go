@@ -11,6 +11,7 @@ import (
 
 type watchIpStatus struct {
 	ReceivedPort map[uint16]struct{}
+	SentPortAt   map[uint16]time.Time
 	LastTime     time.Time
 	IpOption     port.IpOption
 }
@@ -20,6 +21,8 @@ type watchIpStatusTable struct {
 	watchIpS map[string]*watchIpStatus
 	lock     sync.RWMutex
 	isDone   atomic.Bool
+	// onHostTimeout 仅表示 host 观察窗口结束，不参与 pacing 决策。
+	onHostTimeout func(string)
 }
 
 func newWatchIpStatusTable(timeout time.Duration) (w *watchIpStatusTable) {
@@ -38,7 +41,18 @@ func (w *watchIpStatusTable) CreateOrUpdateLastTime(ip string, ipOption port.IpO
 	if ok {
 		wi.LastTime = lastTime
 	} else {
-		w.watchIpS[ip] = &watchIpStatus{LastTime: lastTime, ReceivedPort: make(map[uint16]struct{}), IpOption: ipOption}
+		w.watchIpS[ip] = &watchIpStatus{LastTime: lastTime, ReceivedPort: make(map[uint16]struct{}), SentPortAt: make(map[uint16]time.Time), IpOption: ipOption}
+	}
+	w.lock.Unlock()
+}
+
+// RecordSentPort 记录某个端口的发送时间，用于计算 RTT。
+func (w *watchIpStatusTable) RecordSentPort(ip string, port uint16, sentAt time.Time) {
+	w.lock.Lock()
+	wi, ok := w.watchIpS[ip]
+	if ok {
+		wi.SentPortAt[port] = sentAt
+		wi.LastTime = sentAt
 	}
 	w.lock.Unlock()
 }
@@ -61,6 +75,20 @@ func (w *watchIpStatusTable) HasPort(ip string, port uint16) (has bool) {
 		_, has = wi.ReceivedPort[port]
 	}
 	w.lock.RUnlock()
+	return
+}
+
+// TakeSentPortTime 取出端口发送时间，命中后删除，避免重复记 RTT。
+func (w *watchIpStatusTable) TakeSentPortTime(ip string, port uint16) (sentAt time.Time, ok bool) {
+	w.lock.Lock()
+	wi, has := w.watchIpS[ip]
+	if has {
+		sentAt, ok = wi.SentPortAt[port]
+		if ok {
+			delete(wi.SentPortAt, port)
+		}
+	}
+	w.lock.Unlock()
 	return
 }
 
@@ -108,6 +136,9 @@ func (w *watchIpStatusTable) cleanTimeout(timeout time.Duration) {
 		w.lock.RUnlock()
 		if len(needDel) > 0 {
 			for k := range needDel {
+				if w.onHostTimeout != nil {
+					w.onHostTimeout(k)
+				}
 				w.lock.Lock()
 				delete(w.watchIpS, k)
 				w.lock.Unlock()

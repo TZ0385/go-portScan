@@ -67,3 +67,21 @@ func TestWatchTablesCloseIsIdempotent(t *testing.T) {
 	ips.Close()
 	ips.Close()
 }
+
+func TestWatchIpStatusTimeoutReportsHostTimeout(t *testing.T) {
+	timeoutCh := make(chan string, 1)
+	w := newWatchIpStatusTable(20 * time.Millisecond)
+	w.onHostTimeout = func(host string) {
+		timeoutCh <- host
+	}
+	w.CreateOrUpdateLastTime("127.0.0.1", port.IpOption{})
+	defer w.Close()
+	select {
+	case host := <-timeoutCh:
+		if host != "127.0.0.1" {
+			t.Fatalf("expected timeout host 127.0.0.1, got %s", host)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("expected timeout callback")
+	}
+}

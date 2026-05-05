@@ -20,6 +20,22 @@ type cancelOnWaitHostLimiter struct {
 	cancel context.CancelFunc
 }
 
+type stubSerializeBuffer struct {
+	data []byte
+}
+
+func (b *stubSerializeBuffer) Bytes() []byte { return b.data }
+func (b *stubSerializeBuffer) Clear()        { b.data = nil }
+func (b *stubSerializeBuffer) PrependBytes(n int) ([]byte, error) {
+	b.data = make([]byte, n)
+	return b.data, nil
+}
+func (b *stubSerializeBuffer) AppendBytes(n int) ([]byte, error) {
+	start := len(b.data)
+	b.data = append(b.data, make([]byte, n)...)
+	return b.data[start:], nil
+}
+
 func (l *cancelOnWaitHostLimiter) Wait(_ context.Context, _ string) error {
 	if l.cancel != nil {
 		l.cancel()
@@ -159,6 +175,80 @@ func TestSynScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T
 	}
 	if !watchIpStatusT.IsEmpty() {
 		t.Fatal("expected canceled Scan to stop before watch state is updated")
+	}
+}
+
+func TestSynScannerWaitHostPacerStopsWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ss := &SynScanner{ctx: ctx, cancel: cancel}
+	ss.hostPacer = port.NewHostPacerStore(100, time.Minute, nil)
+	ss.hostPacer.Observe("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
+	cancel()
+	if err := ss.waitHostPacer(net.ParseIP("127.0.0.1")); err == nil {
+		t.Fatal("expected canceled context to stop host pacer wait")
+	}
+}
+
+func TestSynScannerHandleHostSampleUpdatesPacer(t *testing.T) {
+	pacer := port.NewHostPacerStore(100, time.Minute, time.Now)
+	ss := &SynScanner{hostPacer: pacer}
+	ss.observeHostSample("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
+	delay := pacer.DebugSnapshot("127.0.0.1", time.Now()).NextDelay
+	if delay <= 10*time.Millisecond {
+		t.Fatalf("expected RTT sample to increase host pacing delay, got %s", delay)
+	}
+}
+
+func TestSynScannerRecordSentPortAfterSuccessfulSend(t *testing.T) {
+	ip := net.ParseIP("127.0.0.1")
+	ss := &SynScanner{
+		ctx:            context.Background(),
+		watchIpStatusT: newWatchIpStatusTable(time.Second),
+		watchMacCacheT: newWatchMacCacheTable(),
+		bufPool: &sync.Pool{New: func() interface{} {
+			return &stubSerializeBuffer{}
+		}},
+		opts:         gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
+		srcMac:       net.HardwareAddr{0, 1, 2, 3, 4, 5},
+		srcIp:        net.ParseIP("127.0.0.2").To4(),
+		srcIp6:       net.ParseIP("::1"),
+		gwMac:        net.HardwareAddr{6, 7, 8, 9, 10, 11},
+		openPortChan: make(chan port.OpenIpPort, 1),
+		retChan:      make(chan port.OpenIpPort, 1),
+	}
+	ss.watchMacCacheT.UpdateLastTime(ip.String())
+	ss.watchMacCacheT.SetMac(ip.String(), net.HardwareAddr{6, 7, 8, 9, 10, 11})
+	ss.sendPacket = func(...gopacket.SerializableLayer) error {
+		return errors.New("send failed")
+	}
+	defer ss.watchIpStatusT.Close()
+	defer ss.watchMacCacheT.Close()
+
+	err := ss.Scan(ip, 80, port.IpOption{})
+	if err == nil || err.Error() != "send failed" {
+		t.Fatalf("expected send failed error, got %v", err)
+	}
+	if _, ok := ss.watchIpStatusT.TakeSentPortTime(ip.String(), 80); ok {
+		t.Fatal("expected failed send not to record sent port time")
+	}
+}
+
+func TestSynScannerHostPacingDoesNotReplaceFixedHostLimiter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ss := &SynScanner{
+		ctx:         ctx,
+		cancel:      cancel,
+		hostLimiter: newHostLimiter(1),
+		hostPacer:   port.NewHostPacerStore(1, time.Minute, time.Now),
+	}
+	if err := ss.waitHostLimiter(net.ParseIP("127.0.0.1")); err != nil {
+		t.Fatalf("expected first host limiter wait to pass, got %v", err)
+	}
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer blockedCancel()
+	if err := ss.hostLimiter.Wait(blockedCtx, "127.0.0.1"); err == nil {
+		t.Fatal("expected fixed host limiter to remain active")
 	}
 }
 

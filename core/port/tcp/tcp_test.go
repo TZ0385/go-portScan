@@ -166,6 +166,96 @@ func TestTcpScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T
 	}
 }
 
+func TestTcpScannerWaitHostPacerStopsWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	scanner := &TcpScanner{ctx: ctx, cancel: cancel}
+	scanner.hostPacer = port.NewHostPacerStore(100, time.Minute, nil)
+	scanner.hostPacer.Observe("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
+	cancel()
+	if err := scanner.waitHostPacer(net.ParseIP("127.0.0.1")); err == nil {
+		t.Fatal("expected canceled context to stop host pacer wait")
+	}
+}
+
+func TestTcpScannerHandleHostSampleUpdatesPacer(t *testing.T) {
+	pacer := port.NewHostPacerStore(100, time.Minute, time.Now)
+	scanner := &TcpScanner{hostPacer: pacer}
+	scanner.observeHostSample("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
+	delay := pacer.DebugSnapshot("127.0.0.1", time.Now()).NextDelay
+	if delay <= 10*time.Millisecond {
+		t.Fatalf("expected RTT sample to increase host pacing delay, got %s", delay)
+	}
+}
+
+func TestTcpScannerSuccessfulDialUpdatesHostPacing(t *testing.T) {
+	listener, portNum := startTCPTestListener(t)
+	defer listener.Close()
+
+	retChan := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, RatePreHost: 100, Timeout: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+
+	targetIP := net.ParseIP("127.0.0.1")
+	if err := scanner.Scan(targetIP, portNum, port.IpOption{}); err != nil {
+		t.Fatal(err)
+	}
+	scanner.Wait()
+
+	delay := scanner.hostPacer.DebugSnapshot(targetIP.String(), time.Now()).NextDelay
+	if delay <= 0 {
+		t.Fatalf("expected successful dial to create host pacing delay, got %s", delay)
+	}
+}
+
+func TestTcpScannerFailedDialDoesNotUpdateHostPacing(t *testing.T) {
+	retChan := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, RatePreHost: 100, Timeout: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+
+	targetIP := net.ParseIP("203.0.113.1")
+	_ = scanner.Scan(targetIP, 65000, port.IpOption{})
+	scanner.Wait()
+
+	delay := scanner.hostPacer.DebugSnapshot(targetIP.String(), time.Now()).NextDelay
+	if delay != 0 {
+		t.Fatalf("expected failed dial not to change host pacing, got %s", delay)
+	}
+}
+
+func TestTcpScannerHostPacingDoesNotReplaceFixedHostLimiter(t *testing.T) {
+	listener, portNum := startTCPTestListener(t)
+	defer listener.Close()
+
+	retChan := make(chan port.OpenIpPort, 2)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, RatePreHost: 1, Timeout: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+
+	targetIP := net.ParseIP("127.0.0.1")
+	if err := scanner.Scan(targetIP, portNum, port.IpOption{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-retChan:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first open tcp port")
+	}
+
+	blockedCtx, blockedCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer blockedCancel()
+	if err := scanner.hostLimiter.Wait(blockedCtx, targetIP.String()); err == nil {
+		t.Fatal("expected fixed host limiter to remain active")
+	}
+}
+
 func TestTcpScannerKeepsOpenPortWhenHTTPProbeTimesOut(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

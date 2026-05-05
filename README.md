@@ -245,6 +245,7 @@ GLOBAL OPTIONS:
    --port value, -p value            eg: "top1000,5612,65120,-" (default: "top1000")
    --Pn                              no ping probe (default: false)
    --rateP value, --rp value         concurrent num when ping probe each ip (default: 300)
+   --ratePreHost value                per-host base send rate limit, 0 disables the limit (default: 0)
    --PT                              use TCP-PING mode (default: false)
    --sT                              TCP-mode (default: false)
    --timeout value, --to value       TCP-mode SYN-mode timeout. unit is ms. (default: 800)
@@ -266,6 +267,7 @@ GLOBAL OPTIONS:
 ```
 --Pn 在目标禁止PING时使用
 --rate 在网络不稳定时（互联网）可以适当减少（互联网下建议500~1500）
+--ratePreHost 在syn/tcp扫描模式下生效，表示单个 host 的基础发包上限；当设置为大于0时，扫描器还会结合该 host 的 RTT 做额外让路
 --timeout 在网络不稳定时（互联网）可以适当增加
 --nexthop 用于在syn扫描模式下，找不到路由网卡情况时，指定下一跳网关地址（需要是本地网卡上绑定的网关地址）
 --PT ICMP不通时，使用常见端口的TCP探测主机是否存活

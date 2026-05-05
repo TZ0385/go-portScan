@@ -29,6 +29,7 @@ type TcpScanner struct {
 	retChan     chan port.OpenIpPort // 返回值队列
 	limiter     *limiter.Limiter
 	hostLimiter hostLimiter
+	hostPacer   *port.HostPacerStore
 	ctx         context.Context
 	cancel      context.CancelFunc
 	timeout     time.Duration
@@ -55,10 +56,14 @@ func NewTcpScanner(retChan chan port.OpenIpPort, option port.ScannerOption) (ts 
 		retChan:     retChan,
 		limiter:     limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
 		hostLimiter: newHostLimiter(option.RatePreHost),
+		hostPacer:   port.NewHostPacerStore(option.RatePreHost, time.Minute, time.Now),
 		ctx:         ctx,
 		cancel:      cancel,
 		timeout:     time.Duration(option.Timeout) * time.Millisecond,
 		option:      option,
+	}
+	if ts.hostPacer != nil {
+		ts.hostPacer.SetDebug(option.Debug, nil)
 	}
 
 	return
@@ -70,6 +75,9 @@ func (ts *TcpScanner) Scan(ip net.IP, dst uint16, ipOption port.IpOption) error 
 		return errors.New("scanner is closed")
 	}
 	if err := ts.waitHostLimiter(ip); err != nil {
+		return err
+	}
+	if err := ts.waitHostPacer(ip); err != nil {
 		return err
 	}
 	// wait 返回后仍可能已经被 Close/cancel，这里要在启动 goroutine 前再次拦截。
@@ -87,8 +95,10 @@ func (ts *TcpScanner) Scan(ip net.IP, dst uint16, ipOption port.IpOption) error 
 				Ext: ipOption.Ext,
 			},
 		}
+		start := time.Now()
 		conn, _ := (&net.Dialer{Timeout: ts.timeout}).DialContext(ts.ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(dst))))
 		if conn != nil {
+			ts.observeHostSample(ip.String(), port.HostSample{RTT: time.Since(start), HasRTT: true})
 			conn.Close()
 		} else {
 			return
@@ -154,6 +164,20 @@ func (ts *TcpScanner) waitHostLimiter(ip net.IP) error {
 		return nil
 	}
 	return ts.hostLimiter.Wait(ts.ctx, ip.String())
+}
+
+func (ts *TcpScanner) waitHostPacer(ip net.IP) error {
+	if ts.hostPacer == nil || ip == nil {
+		return nil
+	}
+	return ts.hostPacer.Wait(ts.ctx, ip.String())
+}
+
+func (ts *TcpScanner) observeHostSample(host string, sample port.HostSample) {
+	if ts.hostPacer == nil {
+		return
+	}
+	ts.hostPacer.Observe(host, sample)
 }
 
 func (ts *TcpScanner) emitResult(openIpPort port.OpenIpPort) bool {
