@@ -25,6 +25,11 @@ type hostLimiter interface {
 	Wait(context.Context, string) error
 }
 
+type synOpenProbe struct {
+	result port.OpenIpPort
+	probe  pendingProbe
+}
+
 type SynScanner struct {
 	srcMac, gwMac net.HardwareAddr // macAddr
 	devName       string           // eth dev(pcap)
@@ -45,7 +50,7 @@ type SynScanner struct {
 
 	//
 	option         port.ScannerOption
-	openPortChan   chan port.OpenIpPort // inside chan
+	openPortChan   chan synOpenProbe // inside chan
 	portProbeWg    sync.WaitGroup
 	retChan        chan port.OpenIpPort // results chan
 	limiter        *limiter.Limiter
@@ -115,7 +120,7 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 			},
 		},
 		option:         option,
-		openPortChan:   make(chan port.OpenIpPort, cap(retChan)),
+		openPortChan:   make(chan synOpenProbe, cap(retChan)),
 		retChan:        retChan,
 		limiter:        limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
 		hostLimiter:    newHostLimiter(option.RatePreHost),
@@ -129,20 +134,21 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		ss.hostPacer.SetDebug(option.Debug, nil)
 	}
 	ss.sendPacket = ss.send
-	ss.probeLoopWg.Add(1)
-	go func() {
-		defer ss.probeLoopWg.Done()
-		ss.portProbeHandle()
-	}()
 
 	// Pcap
 	// 每个包最大读取长度1024, 不开启混杂模式, no TimeOut
 	handle, err := pcap.OpenLive(devName, 1024, false, pcap.BlockForever)
 	if err != nil {
+		ss.Close()
+		ss = nil
 		return
 	}
 	// Set filter, Reduce the number of monitoring packets
-	handle.SetBPFFilter(fmt.Sprintf("ether dst %s && (arp || tcp[tcpflags] == tcp-syn|tcp-ack || ((ip6[6] = 6) && (ip6[53] & 0x03 != 0)))", srcMac.String()))
+	if err = configureSynRecvFilter(handle, srcMac); err != nil {
+		ss.Close()
+		ss = nil
+		return
+	}
 	ss.handle = handle
 
 	// start listen recv
@@ -157,12 +163,40 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		var dstMac net.HardwareAddr
 		dstMac, err = ss.getHwAddr(gw)
 		if err != nil {
+			ss.Close()
+			ss = nil
 			return
 		}
 		ss.gwMac = dstMac
 	}
 
+	ss.probeLoopWg.Add(1)
+	go func() {
+		defer ss.probeLoopWg.Done()
+		ss.portProbeHandle()
+	}()
+
 	return
+}
+
+func synRecvBPFFilter(mac net.HardwareAddr) string {
+	return fmt.Sprintf(
+		"ether dst %s && (arp || (ip and tcp and (tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack) || tcp[tcpflags] & tcp-rst != 0)) || (ip6 and ip6[6] = 6 and (ip6[53] & 0x12 = 0x12 || ip6[53] & 0x04 != 0)))",
+		mac.String(),
+	)
+}
+
+type synBPFFilterHandle interface {
+	SetBPFFilter(string) error
+	Close()
+}
+
+func configureSynRecvFilter(handle synBPFFilterHandle, mac net.HardwareAddr) error {
+	if err := handle.SetBPFFilter(synRecvBPFFilter(mac)); err != nil {
+		handle.Close()
+		return err
+	}
+	return nil
 }
 
 // Scan scans the dst IP address and port of this scanner.
@@ -183,9 +217,7 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 
 	ss.changeLimiter()
 
-	// watchIp, first
 	ipStr := dstIp.String()
-	ss.watchIpStatusT.CreateOrUpdateLastTime(ipStr, ipOption)
 
 	// First off, get the MAC address we should be sending packets to.
 	var dstMac net.HardwareAddr
@@ -233,8 +265,15 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 		}
 	}
 
+	startedAt := time.Now()
+	key, _, ok := ss.watchIpStatusT.ReserveProbe(ipStr, dst, startedAt, ipOption)
+	if !ok {
+		return errors.New("syn source port range exhausted for pending probes")
+	}
+	srcPort := key.srcPort
+
 	tcp := layers.TCP{
-		SrcPort: layers.TCPPort(49000 + rand.Intn(10000)), // Random source port and used to determine recv dst port range
+		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dst),
 		SYN:     true,
 		Window:  65280,
@@ -269,26 +308,47 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 	if ip4 != nil {
 		tcp.SetNetworkLayerForChecksum(ip4)
 		if err = ss.sendPacket(&eth, ip4, &tcp); err != nil {
+			if probe, dropped := ss.watchIpStatusT.DropProbe(key); dropped {
+				probe.option.EmitProbeDone(port.ProbeEvent{
+					IP:        dstIp,
+					Port:      dst,
+					Outcome:   port.ProbeError,
+					Err:       err,
+					StartedAt: probe.startedAt,
+				})
+			}
 			return err
 		}
-		ss.watchIpStatusT.RecordSentPort(ipStr, dst, time.Now())
 	} else if ip6 != nil {
 		tcp.SetNetworkLayerForChecksum(ip6)
 		if err = ss.sendPacket(&eth, ip6, &tcp); err != nil {
+			if probe, dropped := ss.watchIpStatusT.DropProbe(key); dropped {
+				probe.option.EmitProbeDone(port.ProbeEvent{
+					IP:        dstIp,
+					Port:      dst,
+					Outcome:   port.ProbeError,
+					Err:       err,
+					StartedAt: probe.startedAt,
+				})
+			}
 			return err
 		}
-		ss.watchIpStatusT.RecordSentPort(ipStr, dst, time.Now())
 	}
 	return
 }
 
 func (ss *SynScanner) Wait() {
-	// Delay 2s for a reply from the last packet
-	for i := 0; i < 20; i++ {
-		if ss.watchIpStatusT.IsEmpty() {
-			break
+	if ss.watchIpStatusT != nil {
+		deadline := time.Now().Add(ss.pendingProbeWaitDuration())
+		for {
+			if ss.watchIpStatusT.IsEmpty() {
+				break
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(time.Millisecond * 100)
 		}
-		time.Sleep(time.Millisecond * 100)
 	}
 	// wait inside chan is empty
 	for len(ss.openPortChan) != 0 {
@@ -296,6 +356,14 @@ func (ss *SynScanner) Wait() {
 	}
 	// wait portProbe task
 	ss.portProbeWg.Wait()
+}
+
+func (ss *SynScanner) pendingProbeWaitDuration() time.Duration {
+	timeout := time.Duration(ss.option.Timeout) * time.Millisecond
+	if timeout <= 0 {
+		timeout = time.Duration(DefaultSynOption.Timeout) * time.Millisecond
+	}
+	return timeout + watchIpStatusSweepInterval + 100*time.Millisecond
 }
 
 // Close cleans up scanner-owned resources. The caller owns retChan lifecycle.
@@ -466,35 +534,36 @@ func (ss *SynScanner) macResolveTimeout() time.Duration {
 }
 
 func (ss *SynScanner) portProbeHandle() {
-	for openIpPort := range ss.openPortChan {
-		ss.portProbeWg.Add(1)
+	for _openProbe := range ss.openPortChan {
+		openIpPort := _openProbe.result
 		if !openIpPort.FingerPrint && !openIpPort.Httpx {
-			ss.emitResult(openIpPort)
+			_ = port.EmitOpenProbeResult(ss.ctx, ss.retChan, openIpPort, _openProbe.probe.startedAt)
 			ss.portProbeWg.Done()
 		} else {
-			go func(_openIpPort port.OpenIpPort) {
+			go func(_openProbe synOpenProbe) {
 				defer func() {
 					ss.portProbeWg.Done()
 				}()
-				if _openIpPort.Port != 0 {
+				openIpPort := _openProbe.result
+				if openIpPort.Port != 0 {
 					// openPortChan already carries a confirmed open port; probe failures only skip enrichment.
 					fingerTimeout := ss.option.FingerTimeoutDuration()
-					if _openIpPort.FingerPrint {
-						_openIpPort.Service, _openIpPort.Banner, _ = fingerprint.PortIdentify("tcp", _openIpPort.Ip, _openIpPort.Port, fingerTimeout)
+					if openIpPort.FingerPrint {
+						openIpPort.Service, openIpPort.Banner, _ = fingerprint.PortIdentify("tcp", openIpPort.Ip, openIpPort.Port, fingerTimeout)
 					}
-					if _openIpPort.Httpx && (_openIpPort.Service == "" || _openIpPort.Service == "http" || _openIpPort.Service == "https") {
-						_openIpPort.HttpInfo, _openIpPort.Banner, _ = fingerprint.ProbeHttpInfo(_openIpPort.Ip.String(), _openIpPort.Port, _openIpPort.Service, fingerTimeout)
-						if _openIpPort.HttpInfo != nil {
-							if strings.HasPrefix(_openIpPort.HttpInfo.Url, "https") {
-								_openIpPort.Service = "https"
+					if openIpPort.Httpx && (openIpPort.Service == "" || openIpPort.Service == "http" || openIpPort.Service == "https") {
+						openIpPort.HttpInfo, openIpPort.Banner, _ = fingerprint.ProbeHttpInfo(openIpPort.Ip.String(), openIpPort.Port, openIpPort.Service, fingerTimeout)
+						if openIpPort.HttpInfo != nil {
+							if strings.HasPrefix(openIpPort.HttpInfo.Url, "https") {
+								openIpPort.Service = "https"
 							} else {
-								_openIpPort.Service = "http"
+								openIpPort.Service = "http"
 							}
 						}
 					}
 				}
-				ss.emitResult(_openIpPort)
-			}(openIpPort)
+				_ = port.EmitOpenProbeResult(ss.ctx, ss.retChan, openIpPort, _openProbe.probe.startedAt)
+			}(_openProbe)
 		}
 	}
 }
@@ -791,26 +860,31 @@ func (ss *SynScanner) recv() {
 		if tcpLayer.DstPort != 0 && tcpLayer.DstPort >= 49000 && tcpLayer.DstPort <= 59000 {
 			ipStr = disIp.String()
 			_port = uint16(tcpLayer.SrcPort)
-			ipOption, has := ss.watchIpStatusT.GetIpOption(ipStr)
-			if !has { // IP
-				continue
-			} else {
-				if ss.watchIpStatusT.HasPort(ipStr, _port) { // PORT
-					continue
-				} else {
-					ss.watchIpStatusT.RecordPort(ipStr, _port) // record
-					if sentAt, ok := ss.watchIpStatusT.TakeSentPortTime(ipStr, _port); ok {
-						ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(sentAt), HasRTT: true})
-					}
-				}
-			}
-
+			srcPort := uint16(tcpLayer.DstPort)
 			if tcpLayer.SYN && tcpLayer.ACK {
-				if !ss.enqueueOpenPort(port.OpenIpPort{
-					Ip:       disIp,
-					Port:     _port,
-					IpOption: ipOption,
+				ss.portProbeWg.Add(1)
+				probe, has := ss.watchIpStatusT.TakeProbe(ipStr, srcPort, _port)
+				if !has { // IP/PORT no matching probe
+					ss.portProbeWg.Done()
+					continue
+				}
+				if !probe.sentAt.IsZero() {
+					ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(probe.sentAt), HasRTT: true})
+				}
+				if !ss.enqueueTrackedOpenPort(synOpenProbe{
+					result: port.OpenIpPort{
+						Ip:       disIp,
+						Port:     _port,
+						IpOption: probe.option,
+					},
+					probe: probe,
 				}) {
+					probe.option.EmitProbeDone(port.ProbeEvent{
+						IP:        disIp,
+						Port:      _port,
+						Outcome:   port.ProbeAborted,
+						StartedAt: probe.startedAt,
+					})
 					return
 				}
 				// reply to target
@@ -827,26 +901,45 @@ func (ss *SynScanner) recv() {
 					tcp.SetNetworkLayerForChecksum(&ip4)
 					ss.send(&eth, &ip4, &tcp)
 				}
+			} else if tcpLayer.RST {
+				probe, has := ss.watchIpStatusT.TakeProbe(ipStr, srcPort, _port)
+				if !has { // IP/PORT no matching probe
+					continue
+				}
+				if !probe.sentAt.IsZero() {
+					ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(probe.sentAt), HasRTT: true})
+				}
+				probe.option.EmitProbeDone(port.ProbeEvent{
+					IP:        disIp,
+					Port:      _port,
+					Outcome:   port.ProbeClosed,
+					StartedAt: probe.startedAt,
+				})
 			}
 			tcpLayer.DstPort = 0 // clean tcp parse status
 		}
 	}
 }
-func (ss *SynScanner) enqueueOpenPort(openIpPort port.OpenIpPort) bool {
-	select {
-	case <-ss.ctx.Done():
+
+func (ss *SynScanner) enqueueOpenPort(openProbe synOpenProbe) bool {
+	if ss.ctx.Err() != nil {
 		return false
-	// recv feeds the enrichment stage through this queue; make it cancellation-aware for shutdown.
-	case ss.openPortChan <- openIpPort:
-		return true
 	}
+	ss.portProbeWg.Add(1)
+	return ss.enqueueTrackedOpenPort(openProbe)
 }
 
-func (ss *SynScanner) emitResult(openIpPort port.OpenIpPort) bool {
-	select {
-	case <-ss.ctx.Done():
+func (ss *SynScanner) enqueueTrackedOpenPort(openProbe synOpenProbe) bool {
+	if ss.ctx.Err() != nil {
+		ss.portProbeWg.Done()
 		return false
-	case ss.retChan <- openIpPort:
+	}
+	select {
+	// recv feeds the enrichment stage through this queue; make it cancellation-aware for shutdown.
+	case ss.openPortChan <- openProbe:
 		return true
+	case <-ss.ctx.Done():
+		ss.portProbeWg.Done()
+		return false
 	}
 }

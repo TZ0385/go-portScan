@@ -414,3 +414,69 @@ func TestTcpScannerCloseCancelsBlockedRatePerHostWait(t *testing.T) {
 		t.Fatal("expected close to cancel blocked per-host wait")
 	}
 }
+
+func TestTcpScannerClosedProbeEmitsClosedEvent(t *testing.T) {
+	ret := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(ret, port.ScannerOption{Rate: 100, Timeout: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+
+	events := make(chan port.ProbeEvent, 1)
+	if err := scanner.Scan(net.ParseIP("127.0.0.1"), 1, port.IpOption{
+		OnProbeDone: func(event port.ProbeEvent) { events <- event },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	scanner.Wait()
+
+	select {
+	case event := <-events:
+		if event.Open || event.Outcome != port.ProbeClosed {
+			t.Fatalf("expected closed event, got %#v", event)
+		}
+		if event.Port != 1 || !event.StartedAt.Before(event.FinishedAt) {
+			t.Fatalf("unexpected event timing or port: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed probe did not emit event")
+	}
+	select {
+	case result := <-ret:
+		t.Fatalf("closed probe should not emit result: %#v", result)
+	default:
+	}
+}
+
+func TestTcpScannerOpenProbeEmitsOpenEventAfterResultQueued(t *testing.T) {
+	listener, portNum := startTCPTestListener(t)
+	defer listener.Close()
+
+	ret := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(ret, port.ScannerOption{Rate: 100, Timeout: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+
+	events := make(chan port.ProbeEvent, 1)
+	if err := scanner.Scan(net.ParseIP("127.0.0.1"), portNum, port.IpOption{
+		Ext:         "tcp-open",
+		OnProbeDone: func(event port.ProbeEvent) { events <- event },
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := <-ret
+	event := <-events
+	if !event.Open || event.Outcome != port.ProbeOpen {
+		t.Fatalf("expected open event, got %#v", event)
+	}
+	if event.Result == nil || event.Result.Port != result.Port {
+		t.Fatalf("expected event result to reference queued result, got result=%#v event=%#v", result, event)
+	}
+	if event.Ext != "tcp-open" {
+		t.Fatalf("expected Ext to propagate, got %#v", event.Ext)
+	}
+}

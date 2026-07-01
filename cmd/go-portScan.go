@@ -11,6 +11,7 @@ import (
 	"github.com/XinRoom/iprange"
 	"github.com/panjf2000/ants/v2"
 	"github.com/urfave/cli/v2"
+	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -196,33 +197,7 @@ func run(c *cli.Context) error {
 
 	go func() {
 		for ret := range retChan {
-			if maxOpenPort > 0 {
-				ipPortNumRW.Lock()
-				if _, ok := ipPortNumMap[ret.Ip.String()]; ok {
-					ipPortNumMap[ret.Ip.String()] += 1
-				}
-				ipPortNumRW.Unlock()
-			}
-			if oJson {
-				myLog.Println(ret.Json())
-			} else {
-				myLog.Println(ret.String())
-			}
-			if csvWrite != nil {
-				line := []string{ret.Ip.String(), strconv.Itoa(int(ret.Port)), ret.Service, "", "", "", "", "", "", ""}
-				line[3] = strings.NewReplacer("\\r", "\r", "\\n", "\n").Replace(strings.Trim(strconv.Quote(string(ret.Banner)), "\""))
-				if ret.HttpInfo != nil {
-					line[4] = ret.HttpInfo.Title
-					line[5] = strconv.Itoa(ret.HttpInfo.StatusCode)
-					line[6] = ret.HttpInfo.Server
-					line[7] = ret.HttpInfo.TlsCN
-					line[8] = ret.HttpInfo.Url
-					line[9] = strings.Join(ret.HttpInfo.Fingers, ",")
-				}
-				csvWrite.Write(line)
-				csvWrite.Flush()
-				csvFile.Sync()
-			}
+			consumeResult(ret, myLog, csvWrite, csvFile, &ipPortNumRW, ipPortNumMap)
 		}
 		single <- struct{}{}
 	}()
@@ -344,6 +319,36 @@ func scannerOptionFromFlags() port.ScannerOption {
 		Timeout:     timeout,
 		NextHop:     nexthop,
 		Debug:       debug,
+	}
+}
+
+func consumeResult(ret port.OpenIpPort, myLog *log.Logger, csvWrite *csv.Writer, csvFile *os.File, ipPortNumRW *sync.RWMutex, ipPortNumMap map[string]int) {
+	if maxOpenPort > 0 {
+		ipPortNumRW.Lock()
+		if _, ok := ipPortNumMap[ret.Ip.String()]; ok {
+			ipPortNumMap[ret.Ip.String()] += 1
+		}
+		ipPortNumRW.Unlock()
+	}
+	if oJson {
+		myLog.Println(ret.Json())
+	} else {
+		myLog.Println(ret.String())
+	}
+	if csvWrite != nil {
+		line := []string{ret.Ip.String(), strconv.Itoa(int(ret.Port)), ret.Service, "", "", "", "", "", "", ""}
+		line[3] = strings.NewReplacer("\\r", "\r", "\\n", "\n").Replace(strings.Trim(strconv.Quote(string(ret.Banner)), "\""))
+		if ret.HttpInfo != nil {
+			line[4] = ret.HttpInfo.Title
+			line[5] = strconv.Itoa(ret.HttpInfo.StatusCode)
+			line[6] = ret.HttpInfo.Server
+			line[7] = ret.HttpInfo.TlsCN
+			line[8] = ret.HttpInfo.Url
+			line[9] = strings.Join(ret.HttpInfo.Fingers, ",")
+		}
+		csvWrite.Write(line)
+		csvWrite.Flush()
+		csvFile.Sync()
 	}
 }
 

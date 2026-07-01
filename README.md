@@ -182,8 +182,8 @@ func main() {
 Http Web Cms Finger
 ```go
 // "github.com/XinRoom/go-portScan/core/port/fingerprint"
-func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDailErr bool) {}
-func WebHttpInfo(url2 string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDailErr bool) {}
+func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {}
+func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {}
 
 // "github.com/XinRoom/go-portScan/core/port/fingerprint/webfinger"
 func WebFingerIdent(resp *http.Response) (names []string) {}
@@ -192,7 +192,31 @@ Tcp Port Service Finger
 
 ```go
 // "github.com/XinRoom/go-portScan/core/port/fingerprint"
-func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDailErr bool) {}
+func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDialErr bool) {}
+```
+
+Probe lifecycle callback
+
+```go
+// "github.com/XinRoom/go-portScan/core/port"
+type IpOption struct {
+	FingerPrint bool
+	Httpx       bool
+	Ext         interface{}
+	OnProbeDone func(ProbeEvent)
+}
+
+type ProbeEvent struct {
+	IP         net.IP
+	Port       uint16
+	Open       bool
+	Outcome    ProbeOutcome // ProbeOpen / ProbeClosed / ProbeNoResponse / ProbeError / ProbeAborted
+	Err        error
+	Result     *OpenIpPort
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Ext        interface{}
+}
 ```
 
 ### 4. For More

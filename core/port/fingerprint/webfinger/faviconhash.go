@@ -4,25 +4,53 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"github.com/twmb/murmur3"
-	"regexp"
-)
+	"strings"
 
-var (
-	shortcutText = regexp.MustCompile(`(?im)<link.*?rel=["']?shortcut icon["']?.*?>`)
-	shortcutHref = regexp.MustCompile(`(?im)href=['"]+(.*?)['"]+`)
+	"github.com/twmb/murmur3"
+	"golang.org/x/net/html"
 )
 
 func FindFaviconUrl(body string) string {
-	a := shortcutText.FindStringSubmatch(body)
-	if len(a) > 0 {
-		faviconLink := a[0]
-		b := shortcutHref.FindStringSubmatch(faviconLink)
-		if len(b) > 1 {
-			return b[1]
+	tokenizer := html.NewTokenizer(strings.NewReader(body))
+	for {
+		switch tokenizer.Next() {
+		case html.ErrorToken:
+			return ""
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			if !strings.EqualFold(token.Data, "link") {
+				continue
+			}
+
+			var rel, href string
+			for _, attr := range token.Attr {
+				switch strings.ToLower(attr.Key) {
+				case "rel":
+					rel = attr.Val
+				case "href":
+					href = attr.Val
+				}
+			}
+			if href == "" {
+				continue
+			}
+
+			relTokens := strings.Fields(strings.ToLower(rel))
+			hasIcon := false
+			hasApple := false
+			for _, relToken := range relTokens {
+				if relToken == "icon" {
+					hasIcon = true
+				}
+				if relToken == "apple-touch-icon" || relToken == "apple-touch-icon-precomposed" {
+					hasApple = true
+				}
+			}
+			if hasIcon && !hasApple {
+				return href
+			}
 		}
 	}
-	return ""
 }
 
 func mmh3Hash32(raw []byte) string {

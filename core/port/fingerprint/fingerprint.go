@@ -26,6 +26,8 @@ const (
 	ioTimeoutStr = "i/o timeout"
 )
 
+const readIdleTimeout = 500 * time.Millisecond
+
 type ruleData struct {
 	Action  Action // send or recv
 	Data    []byte // send or match data
@@ -40,8 +42,13 @@ type serviceRule struct {
 var serviceRules = make(map[string]serviceRule)
 var readBufPool = &sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 4096)
+		return make([]byte, 16*1024)
 	},
+}
+
+type deadlineReader interface {
+	Read([]byte) (int, error)
+	SetReadDeadline(time.Time) error
 }
 
 func identifyBudget(timeout time.Duration) time.Duration {
@@ -96,8 +103,9 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 				return
 			}
 			sn2, banner2, isDialErr2 := matchRule(network, ip, _port, "https", attemptTimeout)
-			if !isDialErr && sn2 != "" {
+			if !isDialErr2 && sn2 != "" {
 				sn = sn2
+				serviceName = sn2
 				banner = banner2
 				isDialErr = isDialErr2
 			}
@@ -121,18 +129,16 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		}
 	}
 
-	var lastDailTime time.Duration
-
 	// onlyRecv
 	{
 		var conn net.Conn
 		var n int
+		var matchedService string
 		buf := readBufPool.Get().([]byte)
 		defer func() {
 			readBufPool.Put(buf)
 		}()
 		address := net.JoinHostPort(ip.String(), strconv.Itoa(int(_port)))
-		now := time.Now()
 		attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
 		if !ok {
 			return unknown, banner, false
@@ -141,38 +147,35 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		if conn == nil {
 			return unknown, banner, true
 		}
-		lastDailTime = time.Since(now) * 2
-		if lastDailTime < dailTimeout || dailTimeout <= 0 {
-			dailTimeout = lastDailTime
-			if dailTimeout < 250*time.Millisecond {
-				dailTimeout = 250 * time.Millisecond
-			}
-		}
 		attemptTimeout, ok = remainingTimeout(deadline, dailTimeout)
 		if !ok {
 			conn.Close()
 			return unknown, banner, false
 		}
-		n, _ = read(conn, buf, attemptTimeout)
+		n, _ = readUntil(conn, buf, attemptTimeout, func(current []byte) bool {
+			for _, service := range onlyRecv {
+				if _, ok := matchedRule[service]; ok {
+					continue
+				}
+				for _, rule := range serviceRules[service].DataGroup {
+					if matchRuleWhithBuf(current, ip, _port, rule) {
+						matchedService = service
+						return true
+					}
+				}
+			}
+			return false
+		})
 		conn.Close()
 		if n != 0 {
 			banner = make([]byte, n)
 			copy(banner, buf[:n])
-			for _, service := range onlyRecv {
-				_, ok := matchedRule[service]
-				if ok {
-					continue
-				}
-				for _, rule := range serviceRules[service].DataGroup {
-					if matchRuleWhithBuf(buf[:n], ip, _port, rule) {
-						return service, banner, false
-					}
-				}
-
+			if matchedService != "" {
+				return matchedService, banner, false
 			}
-		}
-		for _, service := range onlyRecv {
-			recordMatched(service)
+			for _, service := range onlyRecv {
+				recordMatched(service)
+			}
 		}
 	}
 
@@ -307,10 +310,30 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 			}
 		} else {
 			var n int
+			var matchedService string
+			matcher := func(current []byte) bool {
+				if matchRuleWhithBuf(current, ip, _port, rule) {
+					matchedService = serviceName
+					return true
+				}
+				// 可归并的服务规则组
+				for _, s := range flowsService {
+					for _, rule2 := range serviceRules[s].DataGroup {
+						if rule2.Action == ActionSend {
+							continue
+						}
+						if matchRuleWhithBuf(current, ip, _port, rule2) {
+							matchedService = s
+							return true
+						}
+					}
+				}
+				return false
+			}
 			if isTls {
-				n, err = read(connTls, buf, dailTimeout)
+				n, err = readUntil(connTls, buf, dailTimeout, matcher)
 			} else {
-				n, err = read(conn, buf, dailTimeout)
+				n, err = readUntil(conn, buf, dailTimeout, matcher)
 			}
 			// 出错就退出
 			if n == 0 {
@@ -318,22 +341,9 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 			}
 			banner = make([]byte, n)
 			copy(banner, buf[:n])
-			// 包含数据就正确
-			if matchRuleWhithBuf(buf[:n], ip, _port, rule) {
-				serviceNameRet = serviceName
+			if matchedService != "" {
+				serviceNameRet = matchedService
 				return
-			}
-			// 可归并的服务规则组
-			for _, s := range flowsService {
-				for _, rule2 := range serviceRules[s].DataGroup {
-					if rule2.Action == ActionSend {
-						continue
-					}
-					if matchRuleWhithBuf(buf[:n], ip, _port, rule2) {
-						serviceNameRet = s
-						return
-					}
-				}
 			}
 		}
 	}
@@ -350,16 +360,49 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 	return
 }
 
-func read(conn interface{}, buf []byte, timeout time.Duration) (int, error) {
-	switch conn.(type) {
-	case net.Conn:
-		conn.(net.Conn).SetReadDeadline(time.Now().Add(timeout))
-		return conn.(net.Conn).Read(buf[:])
-	case *tls.Conn:
-		conn.(*tls.Conn).SetReadDeadline(time.Now().Add(timeout))
-		return conn.(*tls.Conn).Read(buf[:])
+func readUntil(conn deadlineReader, buf []byte, timeout time.Duration, stop func([]byte) bool) (int, error) {
+	deadline := time.Now().Add(timeout)
+	total := 0
+	for total < len(buf) {
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return total, nil
+			}
+			window := remaining
+			if total > 0 {
+				window = readWindow(remaining)
+			}
+			conn.SetReadDeadline(time.Now().Add(window))
+		} else {
+			conn.SetReadDeadline(time.Now().Add(readIdleTimeout))
+		}
+
+		n, err := conn.Read(buf[total:])
+		if n > 0 {
+			total += n
+			if stop != nil && stop(buf[:total]) {
+				return total, nil
+			}
+		}
+		if err != nil {
+			if total > 0 {
+				return total, nil
+			}
+			return total, err
+		}
+		if n == 0 {
+			return total, nil
+		}
 	}
-	return 0, errors.New("unknown type")
+	return total, nil
+}
+
+func readWindow(remaining time.Duration) time.Duration {
+	if remaining < readIdleTimeout {
+		return remaining
+	}
+	return readIdleTimeout
 }
 
 // fix regexp only use utf-8, ref: https://paper.seebug.org/1679/

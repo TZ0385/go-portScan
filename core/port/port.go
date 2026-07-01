@@ -1,6 +1,7 @@
 package port
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -191,11 +192,89 @@ func (so ScannerOption) FingerTimeoutDuration() time.Duration {
 	return time.Duration(FingerTimeout(so.Timeout, so.FingerTimeout)) * time.Millisecond
 }
 
-// IpOption 对开放端口进一步处理参数
+type ProbeOutcome int
+
+const (
+	ProbeOpen ProbeOutcome = iota
+	ProbeClosed
+	ProbeNoResponse
+	ProbeError
+	ProbeAborted
+)
+
+type ProbeEvent struct {
+	IP         net.IP
+	Port       uint16
+	Open       bool
+	Outcome    ProbeOutcome
+	Err        error
+	Result     *OpenIpPort
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Ext        interface{}
+}
+
+// IpOption controls optional enrichment and probe lifecycle observation.
 type IpOption struct {
-	FingerPrint bool        // 探测服务
-	Httpx       bool        // 探测 HttpInfo
-	Ext         interface{} // 扩展属性
+	FingerPrint bool        // Probe service.
+	Httpx       bool        // Probe HttpInfo.
+	Ext         interface{} // Caller-owned extension data.
+
+	// OnProbeDone is optional. When set, scanners call it once after an accepted
+	// probe reaches a terminal state.
+	OnProbeDone func(ProbeEvent)
+}
+
+func (io IpOption) EmitProbeDone(event ProbeEvent) {
+	if io.OnProbeDone == nil {
+		return
+	}
+	if event.FinishedAt.IsZero() {
+		event.FinishedAt = time.Now()
+	}
+	if event.Ext == nil {
+		event.Ext = io.Ext
+	}
+	io.OnProbeDone(event)
+}
+
+func EmitOpenProbeResult(ctx context.Context, retChan chan OpenIpPort, result OpenIpPort, startedAt time.Time) bool {
+	if ctx != nil && ctx.Err() != nil {
+		result.IpOption.EmitProbeDone(ProbeEvent{
+			IP:        result.Ip,
+			Port:      result.Port,
+			Outcome:   ProbeAborted,
+			StartedAt: startedAt,
+		})
+		return false
+	}
+
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+
+	select {
+	case retChan <- result:
+		queued := result
+		result.IpOption.EmitProbeDone(ProbeEvent{
+			IP:        queued.Ip,
+			Port:      queued.Port,
+			Open:      true,
+			Outcome:   ProbeOpen,
+			Result:    &queued,
+			StartedAt: startedAt,
+		})
+		return true
+	case <-done:
+		result.IpOption.EmitProbeDone(ProbeEvent{
+			IP:        result.Ip,
+			Port:      result.Port,
+			Outcome:   ProbeAborted,
+			StartedAt: startedAt,
+		})
+		return false
+	}
 }
 
 // HttpInfo Http服务基础信息

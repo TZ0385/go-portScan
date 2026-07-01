@@ -4,9 +4,11 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,8 @@ type Date struct {
 	Method   string
 	Keyword  []string
 	Or       bool
+
+	compiledRegex []*regexp.Regexp
 }
 
 type WebFinger struct {
@@ -31,6 +35,8 @@ var WebFingers []WebFinger
 
 var onceLoadFingers sync.Once
 var loadedWebFingers atomic.Value
+var webFingersConfigured atomic.Bool
+var titlePattern = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 
 //go:embed finger.json
 var DefFingerData []byte
@@ -54,23 +60,47 @@ func ParseWebFingerData(data []byte) error {
 	if err != nil {
 		return err
 	}
-	normalizeWebFingers(parsed)
+	err = normalizeWebFingers(parsed)
+	if err != nil {
+		return err
+	}
 	WebFingers = parsed
 	loadedWebFingers.Store(parsed)
+	webFingersConfigured.Store(true)
 	return nil
 }
 
-func normalizeWebFingers(fingers []WebFinger) {
+func normalizeWebFingers(fingers []WebFinger) error {
 	for i := range fingers {
 		for j := range fingers[i].Fingers {
-			if fingers[i].Fingers[j].Location != "header" {
-				continue
+			finger := &fingers[i].Fingers[j]
+			if finger.Location == "header" {
+				for k := range finger.Keyword {
+					finger.Keyword[k] = strings.ToLower(finger.Keyword[k])
+				}
 			}
-			for k := range fingers[i].Fingers[j].Keyword {
-				fingers[i].Fingers[j].Keyword[k] = strings.ToLower(fingers[i].Fingers[j].Keyword[k])
+			if finger.Method == "regular" {
+				compiled, err := compileRegularKeywords(finger.Keyword)
+				if err != nil {
+					return err
+				}
+				finger.compiledRegex = compiled
 			}
 		}
 	}
+	return nil
+}
+
+func compileRegularKeywords(keywords []string) ([]*regexp.Regexp, error) {
+	compiled := make([]*regexp.Regexp, 0, len(keywords))
+	for _, keyword := range keywords {
+		re, err := regexp.Compile(keyword)
+		if err != nil {
+			return nil, fmt.Errorf("compile web fingerprint regex %q: %w", keyword, err)
+		}
+		compiled = append(compiled, re)
+	}
+	return compiled, nil
 }
 
 func getWebFingers() []WebFinger {
@@ -82,9 +112,15 @@ func getWebFingers() []WebFinger {
 }
 
 func ensureWebFingersLoaded() {
+	if webFingersConfigured.Load() {
+		return
+	}
 	onceLoadFingers.Do(func() {
-		if len(getWebFingers()) == 0 {
-			_ = ParseWebFingerData(DefFingerData)
+		if webFingersConfigured.Load() {
+			return
+		}
+		if err := ParseWebFingerData(DefFingerData); err != nil {
+			panic(fmt.Sprintf("load embedded web fingerprints: %v", err))
 		}
 	})
 }
@@ -98,7 +134,10 @@ func WebFingerIdent(resp *http.Response) (names []string) {
 	}
 	var dataMap = make(map[string]string)
 	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
 	dataMap["body"] = string(body)
+	dataMap["title"] = extractTitleText(body)
 	var b bytes.Buffer
 	resp.Header.Write(&b)
 	dataMap["header"] = strings.ToLower(b.String())
@@ -114,20 +153,29 @@ func WebFingerIdent(resp *http.Response) (names []string) {
 					flag = true
 				}
 			case "regular":
-				if isregular(dataMap[finger2.Location], finger2.Keyword, finger2.Or) {
+				if isregular(dataMap[finger2.Location], finger2) {
 					flag = true
 				}
 			}
 			if flag {
+				matchedName := finger.Name
 				if finger2.Name != "" {
-					finger.Name += "," + finger2.Name
+					matchedName += "," + finger2.Name
 				}
-				names = append(names, finger.Name)
+				names = append(names, matchedName)
 				break
 			}
 		}
 	}
 	return
+}
+
+func extractTitleText(body []byte) string {
+	matches := titlePattern.FindSubmatch(body)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(string(matches[1]))
 }
 
 // WebFingerIdentByFavicon web系统指纹识别,通过Favicon.ico
@@ -142,10 +190,11 @@ func WebFingerIdentByFavicon(hash string) (names []string) {
 			switch finger2.Method {
 			case "faviconhash":
 				if hash != "" && len(finger2.Keyword) > 0 && hash == finger2.Keyword[0] {
+					matchedName := finger.Name
 					if finger2.Name != "" {
-						finger.Name += "," + finger2.Name
+						matchedName += "," + finger2.Name
 					}
-					names = append(names, finger.Name)
+					names = append(names, matchedName)
 					break
 				}
 			}

@@ -2,9 +2,13 @@ package main
 
 import (
 	"flag"
-	"testing"
-
+	"github.com/XinRoom/go-portScan/core/port"
 	"github.com/urfave/cli/v2"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"testing"
 )
 
 func TestParseFlagBuildsScannerOptionWithRatePreHost(t *testing.T) {
@@ -40,5 +44,33 @@ func TestParseFlagBuildsScannerOptionWithRatePreHost(t *testing.T) {
 	}
 	if option.NextHop != "" {
 		t.Fatalf("expected empty NextHop, got %q", option.NextHop)
+	}
+}
+
+func TestConsumeResultDoesNotEmitProbeLifecycleEvent(t *testing.T) {
+	oldMaxOpenPort := maxOpenPort
+	oldOJson := oJson
+	maxOpenPort = 0
+	oJson = false
+	t.Cleanup(func() {
+		maxOpenPort = oldMaxOpenPort
+		oJson = oldOJson
+	})
+
+	events := make(chan port.ProbeEvent, 1)
+	ret := port.OpenIpPort{
+		Ip:   net.ParseIP("127.0.0.1"),
+		Port: 80,
+		IpOption: port.IpOption{
+			OnProbeDone: func(event port.ProbeEvent) { events <- event },
+		},
+	}
+
+	consumeResult(ret, log.New(io.Discard, "", 0), nil, nil, &sync.RWMutex{}, map[string]int{})
+
+	select {
+	case event := <-events:
+		t.Fatalf("result consumer should not emit lifecycle event: %#v", event)
+	default:
 	}
 }
