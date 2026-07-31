@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -55,16 +56,7 @@ func identifyBudget(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		return 2 * time.Second
 	}
-	// Fingerprint matching may need several protocol attempts; cap the total wall time instead of
-	// reusing the full timeout on every rule.
-	budget := timeout * 4
-	if budget < 2*time.Second {
-		return 2 * time.Second
-	}
-	if budget > 8*time.Second {
-		return 8 * time.Second
-	}
-	return budget
+	return timeout
 }
 
 func remainingTimeout(deadline time.Time, timeout time.Duration) (time.Duration, bool) {
@@ -72,7 +64,11 @@ func remainingTimeout(deadline time.Time, timeout time.Duration) (time.Duration,
 	if remaining <= 0 {
 		return 0, false
 	}
-	if timeout <= 0 || remaining < timeout {
+	const maxAttempt = time.Second
+	if timeout <= 0 || timeout > maxAttempt {
+		timeout = maxAttempt
+	}
+	if remaining < timeout {
 		return remaining, true
 	}
 	return timeout, true
@@ -80,6 +76,13 @@ func remainingTimeout(deadline time.Time, timeout time.Duration) (time.Duration,
 
 // PortIdentify 端口识别
 func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDialErr bool) {
+	return PortIdentifyContext(context.Background(), network, ip, _port, dailTimeout)
+}
+
+func PortIdentifyContext(ctx context.Context, network string, ip net.IP, _port uint16, dailTimeout time.Duration) (serviceName string, banner []byte, isDialErr bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.Now().Add(identifyBudget(dailTimeout))
 
 	matchedRule := make(map[string]struct{})
@@ -102,7 +105,7 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 			if !ok {
 				return
 			}
-			sn2, banner2, isDialErr2 := matchRule(network, ip, _port, "https", attemptTimeout)
+			sn2, banner2, isDialErr2 := matchRule(ctx, network, ip, _port, "https", attemptTimeout)
 			if !isDialErr2 && sn2 != "" {
 				sn = sn2
 				serviceName = sn2
@@ -115,12 +118,15 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 	// 优先判断port可能的服务
 	if serviceNames, ok := portServiceOrder[_port]; ok {
 		for _, service := range serviceNames {
+			if ctx.Err() != nil {
+				return unknown, banner, true
+			}
 			attemptTimeout, ok := remainingTimeout(deadline, dailTimeout)
 			if !ok {
 				return unknown, banner, false
 			}
 			recordMatched(service)
-			sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
+			sn, banner, isDialErr = matchRule(ctx, network, ip, _port, service, attemptTimeout)
 			if sn != "" {
 				return sn, banner, false
 			} else if isDialErr {
@@ -143,10 +149,11 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		if !ok {
 			return unknown, banner, false
 		}
-		conn, _ = net.DialTimeout(network, address, attemptTimeout)
+		conn, _ = (&net.Dialer{Timeout: attemptTimeout}).DialContext(ctx, network, address)
 		if conn == nil {
 			return unknown, banner, true
 		}
+		stopCancel := closeConnOnCancel(ctx, conn)
 		attemptTimeout, ok = remainingTimeout(deadline, dailTimeout)
 		if !ok {
 			conn.Close()
@@ -167,6 +174,7 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 			return false
 		})
 		conn.Close()
+		stopCancel()
 		if n != 0 {
 			banner = make([]byte, n)
 			copy(banner, buf[:n])
@@ -181,6 +189,9 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 
 	// 优先判断Top服务
 	for _, service := range serviceOrder {
+		if ctx.Err() != nil {
+			return unknown, banner, true
+		}
 		_, ok := matchedRule[service]
 		if ok {
 			continue
@@ -190,7 +201,7 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 			return unknown, banner, false
 		}
 		recordMatched(service)
-		sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
+		sn, banner, isDialErr = matchRule(ctx, network, ip, _port, service, attemptTimeout)
 		if sn != "" {
 			return sn, banner, false
 		} else if isDialErr {
@@ -200,6 +211,9 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 
 	// other
 	for _, service := range serviceRuleOrder {
+		if ctx.Err() != nil {
+			return unknown, banner, true
+		}
 		_, ok := matchedRule[service]
 		if ok {
 			continue
@@ -208,7 +222,7 @@ func PortIdentify(network string, ip net.IP, _port uint16, dailTimeout time.Dura
 		if !ok {
 			return unknown, banner, false
 		}
-		sn, banner, isDialErr = matchRule(network, ip, _port, service, attemptTimeout)
+		sn, banner, isDialErr = matchRule(ctx, network, ip, _port, service, attemptTimeout)
 		if sn != "" {
 			return sn, banner, false
 		} else if isDialErr {
@@ -243,7 +257,7 @@ func matchRuleWhithBuf(buf, ip net.IP, _port uint16, rule ruleData) bool {
 }
 
 // 指纹匹配函数
-func matchRule(network string, ip net.IP, _port uint16, serviceName string, dailTimeout time.Duration) (serviceNameRet string, banner []byte, isDialErr bool) {
+func matchRule(ctx context.Context, network string, ip net.IP, _port uint16, serviceName string, dailTimeout time.Duration) (serviceNameRet string, banner []byte, isDialErr bool) {
 	var err error
 	var isTls bool
 	var conn net.Conn
@@ -256,12 +270,18 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 
 	// 建立连接
 	if serviceRule2.Tls {
-		// tls
-		connTls, err = tls.DialWithDialer(&net.Dialer{Timeout: dailTimeout}, network, address, &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS10,
-		})
+		conn, err = (&net.Dialer{Timeout: dailTimeout}).DialContext(ctx, network, address)
+		if err == nil {
+			connTls = tls.Client(conn, &tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS10,
+			})
+			err = connTls.HandshakeContext(ctx)
+		}
 		if err != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
 			if strings.HasSuffix(err.Error(), ioTimeoutStr) || strings.Contains(err.Error(), refusedStr) {
 				isDialErr = true
 				return
@@ -273,14 +293,18 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 			return
 		}
 		defer connTls.Close()
+		stopCancel := closeConnOnCancel(ctx, connTls)
+		defer stopCancel()
 		isTls = true
 	} else {
-		conn, err = net.DialTimeout(network, address, dailTimeout)
+		conn, err = (&net.Dialer{Timeout: dailTimeout}).DialContext(ctx, network, address)
 		if conn == nil {
 			isDialErr = true
 			return
 		}
 		defer conn.Close()
+		stopCancel := closeConnOnCancel(ctx, conn)
+		defer stopCancel()
 	}
 
 	buf := readBufPool.Get().([]byte)
@@ -358,6 +382,14 @@ func matchRule(network string, ip net.IP, _port uint16, serviceName string, dail
 	}
 
 	return
+}
+
+func closeConnOnCancel(ctx context.Context, conn net.Conn) func() {
+	if ctx == nil || conn == nil {
+		return func() {}
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() { stop() }
 }
 
 func readUntil(conn deadlineReader, buf []byte, timeout time.Duration, stop func([]byte) bool) (int, error) {

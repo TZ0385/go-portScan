@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -37,7 +38,7 @@ func TestPortIdentifySlowSSHBanner(t *testing.T) {
 		_, _ = conn.Write([]byte("SSH-2.0-OpenSSH_9.9\r\n"))
 	})
 
-	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, time.Second)
+	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, 2*time.Second)
 	if isDialErr {
 		t.Fatal("expected local listener to be reachable")
 	}
@@ -56,7 +57,7 @@ func TestPortIdentifySlowHTTPResponse(t *testing.T) {
 		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
 	})
 
-	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, time.Second)
+	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, 2*time.Second)
 	if isDialErr {
 		t.Fatal("expected local listener to be reachable")
 	}
@@ -76,7 +77,7 @@ func TestPortIdentifySplitHTTPResponse(t *testing.T) {
 		_, _ = conn.Write([]byte("/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
 	})
 
-	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, time.Second)
+	service, banner, isDialErr := PortIdentify("tcp", net.ParseIP("127.0.0.1"), portNum, 2*time.Second)
 	if isDialErr {
 		t.Fatal("expected local listener to be reachable")
 	}
@@ -254,9 +255,9 @@ func TestIdentifyBudget(t *testing.T) {
 		want    time.Duration
 	}{
 		{name: "default", timeout: 0, want: 2 * time.Second},
-		{name: "minimum", timeout: 250 * time.Millisecond, want: 2 * time.Second},
-		{name: "scaled", timeout: time.Second, want: 4 * time.Second},
-		{name: "maximum", timeout: 3 * time.Second, want: 8 * time.Second},
+		{name: "short", timeout: 250 * time.Millisecond, want: 250 * time.Millisecond},
+		{name: "one second", timeout: time.Second, want: time.Second},
+		{name: "configured total", timeout: 3 * time.Second, want: 3 * time.Second},
 	}
 
 	for _, tt := range tests {
@@ -265,6 +266,19 @@ func TestIdentifyBudget(t *testing.T) {
 				t.Fatalf("identifyBudget(%s) = %s, want %s", tt.timeout, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPortIdentifyContextCancelsBlockedRead(t *testing.T) {
+	portNum := startFingerprintTestListener(t, func(conn net.Conn) {
+		time.Sleep(2 * time.Second)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	started := time.Now()
+	_, _, _ = PortIdentifyContext(ctx, "tcp", net.ParseIP("127.0.0.1"), portNum, 2*time.Second)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("canceled fingerprint took %s", elapsed)
 	}
 }
 
@@ -286,5 +300,5 @@ func TestRemainingTimeout(t *testing.T) {
 
 func Example_identifyBudget() {
 	fmt.Println(identifyBudget(500 * time.Millisecond))
-	// Output: 2s
+	// Output: 500ms
 }

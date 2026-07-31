@@ -19,6 +19,30 @@ func TestNormalizeMiniRate(t *testing.T) {
 	}
 }
 
+func TestShuffleParseAndMergeTopPortsDeduplicatesDefaultPlan(t *testing.T) {
+	ports, err := ShuffleParseAndMergeTopPorts("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[uint16]struct{}, len(ports))
+	for _, value := range ports {
+		if _, exists := seen[value]; exists {
+			t.Fatalf("default scan plan contains duplicate port %d", value)
+		}
+		seen[value] = struct{}{}
+	}
+	if len(ports) == 0 || len(ports) != len(seen) {
+		t.Fatalf("unexpected default plan: %v", ports)
+	}
+
+	// 调用方可排序或复用返回值，不能污染全局 TopTcpPorts。
+	original := TopTcpPorts[0]
+	ports[0] = 0
+	if TopTcpPorts[0] != original {
+		t.Fatal("default scan plan must not alias TopTcpPorts")
+	}
+}
+
 func TestFingerTimeout(t *testing.T) {
 	if got := FingerTimeout(800, 0); got != 2000 {
 		t.Fatalf("expected default finger timeout 2000ms, got %d", got)

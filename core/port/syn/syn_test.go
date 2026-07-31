@@ -1,16 +1,14 @@
+//go:build !nosyn
+
 package syn
 
 import (
 	"context"
 	"errors"
-	"github.com/XinRoom/go-portScan/core/host"
 	"github.com/XinRoom/go-portScan/core/port"
-	"github.com/XinRoom/iprange"
 	"github.com/google/gopacket"
-	"github.com/panjf2000/ants/v2"
-	"log"
+	"github.com/google/gopacket/layers"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -179,35 +177,29 @@ func TestSynScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T
 	}
 }
 
-func TestSynScannerWaitHostPacerStopsWhenContextCanceled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ss := &SynScanner{ctx: ctx, cancel: cancel}
-	ss.hostPacer = port.NewHostPacerStore(100, time.Minute, nil)
-	ss.hostPacer.Observe("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
-	cancel()
-	if err := ss.waitHostPacer(net.ParseIP("127.0.0.1")); err == nil {
-		t.Fatal("expected canceled context to stop host pacer wait")
+func TestSynScannerScanRejectsInvalidTargetBeforeNetworkWork(t *testing.T) {
+	ss := &SynScanner{ctx: context.Background()}
+	for _, target := range []struct {
+		ip   net.IP
+		port uint16
+	}{
+		{ip: nil, port: 80},
+		{ip: net.IP{1, 2, 3}, port: 80},
+		{ip: net.ParseIP("192.0.2.10"), port: 0},
+	} {
+		if err := ss.Scan(target.ip, target.port, port.IpOption{}); err == nil {
+			t.Fatalf("target ip=%v port=%d should be rejected", target.ip, target.port)
+		}
 	}
 }
 
-func TestSynScannerHandleHostSampleUpdatesPacer(t *testing.T) {
-	pacer := port.NewHostPacerStore(100, time.Minute, time.Now)
-	ss := &SynScanner{hostPacer: pacer}
-	ss.observeHostSample("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
-	delay := pacer.DebugSnapshot("127.0.0.1", time.Now()).NextDelay
-	if delay <= 10*time.Millisecond {
-		t.Fatalf("expected RTT sample to increase host pacing delay, got %s", delay)
-	}
-}
-
-func TestSynScannerHostPacingDoesNotReplaceFixedHostLimiter(t *testing.T) {
+func TestSynScannerFixedHostLimiterRemainsActive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ss := &SynScanner{
 		ctx:         ctx,
 		cancel:      cancel,
 		hostLimiter: newHostLimiter(1),
-		hostPacer:   port.NewHostPacerStore(1, time.Minute, time.Now),
 	}
 	if err := ss.waitHostLimiter(net.ParseIP("127.0.0.1")); err != nil {
 		t.Fatalf("expected first host limiter wait to pass, got %v", err)
@@ -277,13 +269,16 @@ func TestSynScannerGetHwAddrV6TimesOutWithoutNeighborReply(t *testing.T) {
 	}
 }
 
-func TestSynRecvBPFFilterIncludesRSTPackets(t *testing.T) {
+func TestSynRecvBPFFilterIncludesRequiredResponses(t *testing.T) {
 	filter := synRecvBPFFilter(net.HardwareAddr{0, 1, 2, 3, 4, 5})
 	if !strings.Contains(filter, "tcp-rst") && !strings.Contains(filter, "0x04") {
 		t.Fatalf("expected filter to include RST capture, got %q", filter)
 	}
 	if !strings.Contains(filter, "tcp-syn|tcp-ack") && !strings.Contains(filter, "0x12") {
 		t.Fatalf("expected filter to include SYN+ACK capture, got %q", filter)
+	}
+	if !strings.Contains(filter, "ip6[40] = 136") {
+		t.Fatalf("expected filter to include ICMPv6 neighbor advertisements, got %q", filter)
 	}
 }
 
@@ -539,65 +534,67 @@ func TestConfigureSynRecvFilterClosesHandleOnError(t *testing.T) {
 	}
 }
 
-func TestSynScannerScanIntegration(t *testing.T) {
-	if os.Getenv("GO_PORTSCAN_RUN_SYN_INTEGRATION") != "1" {
-		t.Skip("set GO_PORTSCAN_RUN_SYN_INTEGRATION=1 to run SYN scanner integration test")
-	}
-
-	single := make(chan struct{})
-	retChan := make(chan port.OpenIpPort, 65535)
-	go func() {
-		for ret := range retChan {
-			log.Println(ret)
+func TestNewSynScannerRejectsNonPositiveTimeout(t *testing.T) {
+	for _, timeout := range []int{0, -1} {
+		_, err := NewSynScanner(net.ParseIP("192.0.2.1"), make(chan port.OpenIpPort), port.ScannerOption{
+			Rate:    100,
+			Timeout: timeout,
+		})
+		if err == nil {
+			t.Fatalf("timeout=%d should be rejected before opening pcap", timeout)
 		}
-		single <- struct{}{}
-	}()
+	}
+}
 
-	// 解析端口字符串并且优先发送 TopTcpPorts 中的端口, eg: 1-65535,top1000
-	ports, err := port.ShuffleParseAndMergeTopPorts("top1000")
-	if err != nil {
+func TestSynScannerCachesIPv6NeighborAdvertisementByTargetAddress(t *testing.T) {
+	table := newWatchMacCacheTable()
+	defer table.Close()
+	target := net.ParseIP("2001:db8::10")
+	mac := net.HardwareAddr{0, 1, 2, 3, 4, 5}
+	table.UpdateLastTime(target.String())
+
+	ss := &SynScanner{watchMacCacheT: table}
+	ss.cacheIPv6NeighborAdvertisement(target, mac)
+
+	if got := table.GetMac(target.String()); got == nil || got.String() != mac.String() {
+		t.Fatalf("IPv6 neighbor MAC = %v, want %v", got, mac)
+	}
+}
+
+func TestSynRecvParserDecodesIPv6NeighborAdvertisement(t *testing.T) {
+	sourceMAC := net.HardwareAddr{0, 1, 2, 3, 4, 5}
+	target := net.ParseIP("2001:db8::10")
+	ipv6 := layers.IPv6{
+		Version:    6,
+		HopLimit:   64,
+		NextHeader: layers.IPProtocolICMPv6,
+		SrcIP:      net.ParseIP("fe80::1"),
+		DstIP:      net.ParseIP("ff02::1"),
+	}
+	icmpv6 := layers.ICMPv6{
+		TypeCode: layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborAdvertisement, 0),
+	}
+	icmpv6.SetNetworkLayerForChecksum(&ipv6)
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
+		&layers.Ethernet{SrcMAC: sourceMAC, DstMAC: net.HardwareAddr{6, 7, 8, 9, 10, 11}, EthernetType: layers.EthernetTypeIPv6},
+		&ipv6,
+		&icmpv6,
+		&layers.ICMPv6NeighborAdvertisement{TargetAddress: target},
+	); err != nil {
 		t.Fatal(err)
 	}
 
-	// parse ip
-	it, startIp, _ := iprange.NewIter("1.1.1.1/30")
-
-	// scanner
-	ss, err := NewSynScanner(startIp, retChan, DefaultSynOption)
-	if err != nil {
+	var eth layers.Ethernet
+	var decodedIPv6 layers.IPv6
+	var decodedICMPv6 layers.ICMPv6
+	var decodedNA layers.ICMPv6NeighborAdvertisement
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &decodedIPv6, &decodedICMPv6, &decodedNA)
+	var decoded []gopacket.LayerType
+	if err := parser.DecodeLayers(buf.Bytes(), &decoded); err != nil {
 		t.Fatal(err)
 	}
-
-	// port scan func
-	portScan := func(ip net.IP) {
-		for _, _port := range ports { // port
-			ss.WaitLimiter()
-			ss.Scan(ip, _port, port.IpOption{}) // syn 不能并发，默认以网卡和驱动最高性能发包
-		}
+	if decodedNA.TargetAddress == nil || !decodedNA.TargetAddress.Equal(target) {
+		t.Fatalf("decoded NA target = %v, want %v", decodedNA.TargetAddress, target)
 	}
-
-	// Pool - ping and port scan
-	var wgPing sync.WaitGroup
-	poolPing, _ := ants.NewPoolWithFunc(50, func(ip interface{}) {
-		_ip := ip.(net.IP)
-		if host.IsLive(_ip.String(), true, 800*time.Millisecond) {
-			portScan(_ip)
-		}
-		wgPing.Done()
-	})
-	defer poolPing.Release()
-
-	start := time.Now()
-	for i := uint64(0); i < it.TotalNum(); i++ { // ip索引
-		ip := make(net.IP, len(it.GetIpByIndex(0)))
-		copy(ip, it.GetIpByIndex(i)) // Note: dup copy []byte when concurrent (GetIpByIndex not to do dup copy)
-		wgPing.Add(1)
-		poolPing.Invoke(ip)
-	}
-
-	wgPing.Wait()
-	ss.Wait()
-	ss.Close()
-	<-single
-	t.Log(time.Since(start))
 }

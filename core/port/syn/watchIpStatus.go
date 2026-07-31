@@ -1,8 +1,9 @@
-//go:build !nosyn
+﻿//go:build !nosyn
 
 package syn
 
 import (
+	"context"
 	"github.com/XinRoom/go-portScan/core/port"
 	"net"
 	"sync"
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	watchIpStatusSweepInterval = time.Second
+	watchIpStatusSweepInterval = 250 * time.Millisecond
 	synSourcePortMin           = uint16(49000)
 	synSourcePortMax           = uint16(58999)
 )
@@ -27,6 +28,24 @@ type pendingProbe struct {
 	option    port.IpOption
 	startedAt time.Time
 	sentAt    time.Time
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	retried bool
+	retry   func() error
+}
+
+func (p pendingProbe) context() context.Context {
+	if p.ctx != nil {
+		return p.ctx
+	}
+	return context.Background()
+}
+
+func (p pendingProbe) cancelContext() {
+	if p.cancel != nil {
+		p.cancel()
+	}
 }
 
 // IP状态更新表
@@ -35,8 +54,8 @@ type watchIpStatusTable struct {
 	nextSrcPort uint16
 	lock        sync.RWMutex
 	isDone      atomic.Bool
-	// onHostTimeout 仅表示 host 观察窗口结束，不参与 pacing 决策。
-	onHostTimeout func(string)
+	// onProbeTimeout 返回 true 表示已由一次抽样重探接管，本轮不发送终态事件。
+	onProbeTimeout func(pendingProbe) bool
 }
 
 func newWatchIpStatusTable(timeout time.Duration) (w *watchIpStatusTable) {
@@ -60,6 +79,10 @@ func (w *watchIpStatusTable) RecordSentProbe(ip string, srcPort, dstPort uint16,
 }
 
 func (w *watchIpStatusTable) ReserveProbe(ip string, dstPort uint16, sentAt time.Time, option port.IpOption) (probeKey, pendingProbe, bool) {
+	return w.ReserveProbeContext(context.Background(), nil, ip, dstPort, sentAt, option)
+}
+
+func (w *watchIpStatusTable) ReserveProbeContext(ctx context.Context, cancel context.CancelFunc, ip string, dstPort uint16, sentAt time.Time, option port.IpOption) (probeKey, pendingProbe, bool) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 
@@ -74,7 +97,7 @@ func (w *watchIpStatusTable) ReserveProbe(ip string, dstPort uint16, sentAt time
 		srcPort := synSourcePortMin + uint16((startOffset+offset)%rangeSize)
 		key := probeKey{ip: ip, srcPort: srcPort, dstPort: dstPort}
 		if _, exists := w.probes[key]; !exists {
-			probe := pendingProbe{key: key, option: option, startedAt: sentAt, sentAt: sentAt}
+			probe := pendingProbe{key: key, option: option, startedAt: sentAt, sentAt: sentAt, ctx: ctx, cancel: cancel}
 			w.probes[key] = probe
 			if srcPort == synSourcePortMax {
 				w.nextSrcPort = synSourcePortMin
@@ -110,6 +133,50 @@ func (w *watchIpStatusTable) DropProbe(key probeKey) (pendingProbe, bool) {
 	return probe, ok
 }
 
+func (w *watchIpStatusTable) SetRetry(key probeKey, retry func() error) bool {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	probe, ok := w.probes[key]
+	if !ok {
+		return false
+	}
+	probe.retry = retry
+	w.probes[key] = probe
+	return true
+}
+
+func (w *watchIpStatusTable) TouchProbe(key probeKey, sentAt time.Time) bool {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	probe, ok := w.probes[key]
+	if !ok {
+		return false
+	}
+	probe.sentAt = sentAt
+	w.probes[key] = probe
+	return true
+}
+
+func (w *watchIpStatusTable) RearmProbe(probe pendingProbe) bool {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.isDone.Load() || probe.context().Err() != nil {
+		return false
+	}
+	if _, exists := w.probes[probe.key]; exists {
+		return false
+	}
+	probe.retried = true
+	w.probes[probe.key] = probe
+	return true
+}
+
+func (w *watchIpStatusTable) Len() int {
+	w.lock.RLock()
+	defer w.lock.RUnlock()
+	return len(w.probes)
+}
+
 // IsEmpty 判断目前表是否为空
 func (w *watchIpStatusTable) IsEmpty() (empty bool) {
 	w.lock.RLock()
@@ -134,6 +201,7 @@ func (w *watchIpStatusTable) Close() {
 			Outcome:   port.ProbeAborted,
 			StartedAt: probe.startedAt,
 		})
+		probe.cancelContext()
 	}
 }
 
@@ -146,28 +214,33 @@ func (w *watchIpStatusTable) cleanTimeout(timeout time.Duration) {
 		time.Sleep(watchIpStatusSweepInterval)
 		w.lock.Lock()
 		var expired []pendingProbe
-		expiredHosts := make(map[string]struct{})
 		now := time.Now()
 		for key, probe := range w.probes {
-			if now.Sub(probe.sentAt) > timeout {
+			if probe.context().Err() != nil || (!probe.sentAt.IsZero() && now.Sub(probe.sentAt) > timeout) {
 				expired = append(expired, probe)
-				expiredHosts[key.ip] = struct{}{}
 				delete(w.probes, key)
 			}
 		}
 		w.lock.Unlock()
-		for ip := range expiredHosts {
-			if w.onHostTimeout != nil {
-				w.onHostTimeout(ip)
-			}
-		}
 		for _, probe := range expired {
-			probe.option.EmitProbeDone(port.ProbeEvent{
-				IP:        net.ParseIP(probe.key.ip),
-				Port:      probe.key.dstPort,
-				Outcome:   port.ProbeNoResponse,
-				StartedAt: probe.startedAt,
-			})
+			w.finishExpiredProbe(probe)
 		}
 	}
+}
+
+func (w *watchIpStatusTable) finishExpiredProbe(probe pendingProbe) {
+	// probe 已移出表后仍可能与 Close 交错；发送终态前再次判断，保证关闭统一收口为 Aborted。
+	outcome := port.ProbeNoResponse
+	if w.isDone.Load() || probe.context().Err() != nil {
+		outcome = port.ProbeAborted
+	} else if w.onProbeTimeout != nil && w.onProbeTimeout(probe) {
+		return
+	}
+	probe.option.EmitProbeDone(port.ProbeEvent{
+		IP:        net.ParseIP(probe.key.ip),
+		Port:      probe.key.dstPort,
+		Outcome:   outcome,
+		StartedAt: probe.startedAt,
+	})
+	probe.cancelContext()
 }

@@ -291,7 +291,7 @@ GLOBAL OPTIONS:
 ```
 --Pn 在目标禁止PING时使用
 --rate 在网络不稳定时（互联网）可以适当减少（互联网下建议500~1500）
---ratePreHost 在syn/tcp扫描模式下生效，表示单个 host 的基础发包上限；当设置为大于0时，扫描器还会结合该 host 的 RTT 做额外让路
+--ratePreHost 在syn/tcp扫描模式下生效，表示跨任务共享的单个 host 固定发包上限；0 表示不限制
 --timeout 在网络不稳定时（互联网）可以适当增加
 --nexthop 用于在syn扫描模式下，找不到路由网卡情况时，指定下一跳网关地址（需要是本地网卡上绑定的网关地址）
 --PT ICMP不通时，使用常见端口的TCP探测主机是否存活
@@ -301,3 +301,5 @@ GLOBAL OPTIONS:
 --httpx 用于探测http服务的title等信息
 --mop 用于目标组内存在防扫描防火墙的情况，单个IP扫描到开放的端口到达该值就停止对该IP扫描，避免浪费时间（建议值500）
 ```
+
+作为长生命周期共享 scanner 使用时，优先通过 `port.ContextScanner.ProbeContext` 提交探针。该入口把限速等待、任务取消和探针提交绑定在同一个 context；TCP 在途连接和服务指纹任务均有固定并发上限，指纹队列满时会保留开放端口并降级为 `unknown`。

@@ -122,6 +122,152 @@ func TestTcpScannerCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestTcpScannerUsesSmallStableBurst(t *testing.T) {
+	scanner, err := NewTcpScanner(make(chan port.OpenIpPort, 1), port.ScannerOption{Rate: 600, Timeout: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scanner.Close()
+	if got := scanner.limiter.Burst(); got != 6 {
+		t.Fatalf("limiter burst = %d, want 6", got)
+	}
+}
+
+func TestTcpScannerFingerprintQueueFullStillEmitsUnknownOpenPort(t *testing.T) {
+	listener, portNum := startTCPTestListener(t)
+	defer listener.Close()
+
+	retChan := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{
+		Rate:              100,
+		Timeout:           200,
+		FingerTimeout:     200,
+		FingerConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if !scanner.fingerPool.TrySubmit(func() {
+		close(started)
+		<-release
+	}) {
+		t.Fatal("failed to occupy fingerprint worker")
+	}
+	<-started
+	for i := 0; i < 4; i++ {
+		if !scanner.fingerPool.TrySubmit(func() { <-release }) {
+			t.Fatalf("failed to fill fingerprint queue at index %d", i)
+		}
+	}
+
+	events := make(chan port.ProbeEvent, 2)
+	if err := scanner.Scan(net.ParseIP("127.0.0.1"), portNum, port.IpOption{
+		FingerPrint: true,
+		OnProbeDone: func(event port.ProbeEvent) { events <- event },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-retChan:
+		if result.Service != "unknown" {
+			t.Fatalf("degraded service = %q, want unknown", result.Service)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for degraded open-port result")
+	}
+	select {
+	case event := <-events:
+		if event.Outcome != port.ProbeOpen {
+			t.Fatalf("probe outcome = %v, want open", event.Outcome)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal probe event")
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected duplicate terminal event: %+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	scanner.Close()
+}
+
+func TestTcpScannerFingerprintAndHTTPShareTotalBudget(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var accepted atomic.Int32
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn, index int32) {
+				defer conn.Close()
+				if index == 1 {
+					_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+					return
+				}
+				time.Sleep(2 * time.Second)
+			}(conn, accepted.Add(1))
+		}
+	}()
+	_, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNumber, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retChan := make(chan port.OpenIpPort, 1)
+	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, Timeout: 200, FingerTimeout: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now()
+	scanner.enrichAndEmit(context.Background(), port.OpenIpPort{
+		Ip:       net.ParseIP("127.0.0.1"),
+		Port:     uint16(portNumber),
+		IpOption: port.IpOption{FingerPrint: true, Httpx: true},
+	}, startedAt)
+	if elapsed := time.Since(startedAt); elapsed > 700*time.Millisecond {
+		t.Fatalf("combined fingerprint budget exceeded: %s", elapsed)
+	}
+	select {
+	case <-retChan:
+	default:
+		t.Fatal("open port was lost after enrichment timeout")
+	}
+	scanner.Close()
+}
+
+func TestTcpScannerProbeContextCancelsWhileWaitingForCapacity(t *testing.T) {
+	scanner, err := NewTcpScanner(make(chan port.OpenIpPort, 1), port.ScannerOption{
+		Rate:          100,
+		Timeout:       100,
+		MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner.inflight <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = scanner.ProbeContext(ctx, net.ParseIP("127.0.0.1"), 80, port.IpOption{})
+	<-scanner.inflight
+	scanner.Close()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProbeContext error = %v, want context canceled", err)
+	}
+}
+
 func TestTcpScannerCloseDoesNotCloseResultChannel(t *testing.T) {
 	retChan := make(chan port.OpenIpPort, 1)
 	scanner, err := NewTcpScanner(retChan, port.ScannerOption{
@@ -166,69 +312,7 @@ func TestTcpScannerScanStopsWhenContextCanceledAfterHostLimiterWait(t *testing.T
 	}
 }
 
-func TestTcpScannerWaitHostPacerStopsWhenContextCanceled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	scanner := &TcpScanner{ctx: ctx, cancel: cancel}
-	scanner.hostPacer = port.NewHostPacerStore(100, time.Minute, nil)
-	scanner.hostPacer.Observe("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
-	cancel()
-	if err := scanner.waitHostPacer(net.ParseIP("127.0.0.1")); err == nil {
-		t.Fatal("expected canceled context to stop host pacer wait")
-	}
-}
-
-func TestTcpScannerHandleHostSampleUpdatesPacer(t *testing.T) {
-	pacer := port.NewHostPacerStore(100, time.Minute, time.Now)
-	scanner := &TcpScanner{hostPacer: pacer}
-	scanner.observeHostSample("127.0.0.1", port.HostSample{RTT: 200 * time.Millisecond, HasRTT: true})
-	delay := pacer.DebugSnapshot("127.0.0.1", time.Now()).NextDelay
-	if delay <= 10*time.Millisecond {
-		t.Fatalf("expected RTT sample to increase host pacing delay, got %s", delay)
-	}
-}
-
-func TestTcpScannerSuccessfulDialUpdatesHostPacing(t *testing.T) {
-	listener, portNum := startTCPTestListener(t)
-	defer listener.Close()
-
-	retChan := make(chan port.OpenIpPort, 1)
-	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, RatePreHost: 100, Timeout: 500})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer scanner.Close()
-
-	targetIP := net.ParseIP("127.0.0.1")
-	if err := scanner.Scan(targetIP, portNum, port.IpOption{}); err != nil {
-		t.Fatal(err)
-	}
-	scanner.Wait()
-
-	delay := scanner.hostPacer.DebugSnapshot(targetIP.String(), time.Now()).NextDelay
-	if delay <= 0 {
-		t.Fatalf("expected successful dial to create host pacing delay, got %s", delay)
-	}
-}
-
-func TestTcpScannerFailedDialDoesNotUpdateHostPacing(t *testing.T) {
-	retChan := make(chan port.OpenIpPort, 1)
-	scanner, err := NewTcpScanner(retChan, port.ScannerOption{Rate: 100, RatePreHost: 100, Timeout: 50})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer scanner.Close()
-
-	targetIP := net.ParseIP("203.0.113.1")
-	_ = scanner.Scan(targetIP, 65000, port.IpOption{})
-	scanner.Wait()
-
-	delay := scanner.hostPacer.DebugSnapshot(targetIP.String(), time.Now()).NextDelay
-	if delay != 0 {
-		t.Fatalf("expected failed dial not to change host pacing, got %s", delay)
-	}
-}
-
-func TestTcpScannerHostPacingDoesNotReplaceFixedHostLimiter(t *testing.T) {
+func TestTcpScannerFixedHostLimiterRemainsActive(t *testing.T) {
 	listener, portNum := startTCPTestListener(t)
 	defer listener.Close()
 

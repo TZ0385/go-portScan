@@ -3,12 +3,56 @@
 package syn
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/XinRoom/go-portScan/core/port"
 )
+
+func TestWatchIpStatusCanceledProbeAbortsWithinSweep(t *testing.T) {
+	table := newWatchIpStatusTable(5 * time.Second)
+	defer table.Close()
+	events := make(chan port.ProbeEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	_, _, ok := table.ReserveProbeContext(ctx, nil, "192.0.2.10", 443, time.Now(), port.IpOption{
+		OnProbeDone: func(event port.ProbeEvent) { events <- event },
+	})
+	if !ok {
+		t.Fatal("failed to reserve probe")
+	}
+	cancel()
+	select {
+	case event := <-events:
+		if event.Outcome != port.ProbeAborted {
+			t.Fatalf("probe outcome = %v, want aborted", event.Outcome)
+		}
+	case <-time.After(600 * time.Millisecond):
+		t.Fatal("canceled SYN probe did not converge within one sweep window")
+	}
+	if !table.IsEmpty() {
+		t.Fatal("canceled probe remained in pending table")
+	}
+}
+
+func TestWatchIpStatusDoesNotTimeoutQueuedRetryBeforeSend(t *testing.T) {
+	table := newWatchIpStatusTable(20 * time.Millisecond)
+	defer table.Close()
+	probe := pendingProbe{
+		key:     probeKey{ip: "192.0.2.10", srcPort: 49152, dstPort: 443},
+		ctx:     context.Background(),
+		retried: true,
+		// sentAt 为零表示仍在等待全局 token，网络超时尚未开始。
+	}
+	if !table.RearmProbe(probe) {
+		t.Fatal("failed to rearm queued retry")
+	}
+	time.Sleep(2 * watchIpStatusSweepInterval)
+	if table.IsEmpty() {
+		t.Fatal("queued retry must not expire before it is actually sent")
+	}
+}
 
 func TestWatchMacCacheTable(t *testing.T) {
 	table := newWatchMacCacheTable()
@@ -42,24 +86,6 @@ func TestWatchTablesCloseIsIdempotent(t *testing.T) {
 	ips := newWatchIpStatusTable(time.Second)
 	ips.Close()
 	ips.Close()
-}
-
-func TestWatchIpStatusTimeoutReportsHostTimeout(t *testing.T) {
-	timeoutCh := make(chan string, 1)
-	w := newWatchIpStatusTable(20 * time.Millisecond)
-	w.onHostTimeout = func(host string) {
-		timeoutCh <- host
-	}
-	w.RecordSentProbe("127.0.0.1", 49152, 443, time.Now().Add(-time.Second), port.IpOption{})
-	defer w.Close()
-	select {
-	case host := <-timeoutCh:
-		if host != "127.0.0.1" {
-			t.Fatalf("expected timeout host 127.0.0.1, got %s", host)
-		}
-	case <-time.After(1500 * time.Millisecond):
-		t.Fatal("expected timeout callback")
-	}
 }
 
 func TestWatchIpStatusRejectsDuplicateProbeKey(t *testing.T) {
@@ -243,5 +269,30 @@ func TestWatchIpStatusCloseAbortsPendingProbes(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected aborted event")
+	}
+}
+
+func TestWatchIpStatusCloseAbortsProbeAlreadyCollectedForTimeout(t *testing.T) {
+	events := make(chan port.ProbeEvent, 1)
+	w := newWatchIpStatusTable(time.Second)
+	w.Close()
+
+	// 模拟清理协程已从 map 取出 probe，此时 Close 不能再找到它。
+	w.finishExpiredProbe(pendingProbe{
+		key:       probeKey{ip: "192.0.2.10", srcPort: 49152, dstPort: 443},
+		startedAt: time.Now(),
+		ctx:       context.Background(),
+		option: port.IpOption{
+			OnProbeDone: func(event port.ProbeEvent) { events <- event },
+		},
+	})
+
+	select {
+	case event := <-events:
+		if event.Outcome != port.ProbeAborted {
+			t.Fatalf("expected close to abort collected timeout probe, got %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected aborted event for collected timeout probe")
 	}
 }

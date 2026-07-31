@@ -1,4 +1,4 @@
-//go:build !nosyn
+﻿//go:build !nosyn
 
 package syn
 
@@ -47,15 +47,17 @@ type SynScanner struct {
 	bufPool *sync.Pool
 	// sendPacket 仅用于测试中注入发送失败，生产默认走 send。
 	sendPacket func(...gopacket.SerializableLayer) error
+	// 多个 host 任务可以并行准备 probe，但同一个 pcap handle 的写入与关闭必须串行。
+	sendMu sync.Mutex
 
 	//
 	option         port.ScannerOption
 	openPortChan   chan synOpenProbe // inside chan
 	portProbeWg    sync.WaitGroup
+	fingerPool     *port.WorkPool
 	retChan        chan port.OpenIpPort // results chan
 	limiter        *limiter.Limiter
 	hostLimiter    hostLimiter
-	hostPacer      *port.HostPacerStore
 	ctx            context.Context
 	cancel         context.CancelFunc
 	watchIpStatusT *watchIpStatusTable // IpStatusCacheTable
@@ -64,12 +66,10 @@ type SynScanner struct {
 	closeOnce      sync.Once
 	recvWg         sync.WaitGroup
 	probeLoopWg    sync.WaitGroup
-
-	// stat
-	lastStatProbeTime time.Time
-	lastRate          int
-	lastMaxTokenTimes int // 连续最大可用Token次数
-	lastMinTokenTimes int // 连续最小可用Token次数
+	adaptive       *synAdaptiveLimiter
+	retryChan      chan pendingProbe
+	retryWg        sync.WaitGroup
+	pcapStats      func() (*pcap.Stats, error)
 }
 
 // NewSynScanner firstIp: Used to select routes; openPortChan: Result return channel
@@ -77,6 +77,11 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 	// option verify
 	if option.Rate < 10 {
 		err = errors.New("rate can not set < 10")
+		return
+	}
+	if option.Timeout <= 0 {
+		// 超时表按固定周期清理，非正 timeout 会退化为异常短的响应窗口，必须在构造阶段拒绝。
+		err = errors.New("timeout can not set to 0")
 		return
 	}
 
@@ -105,6 +110,14 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 	rand.Seed(time.Now().Unix())
 
 	ctx, cancel := context.WithCancel(context.Background())
+	fingerConcurrency := option.FingerConcurrency
+	if fingerConcurrency <= 0 {
+		fingerConcurrency = 64
+	}
+	burst := option.Rate / 100
+	if burst < 1 {
+		burst = 1
+	}
 	ss = &SynScanner{
 		opts: gopacket.SerializeOptions{
 			FixLengths:       true,
@@ -121,17 +134,16 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		},
 		option:         option,
 		openPortChan:   make(chan synOpenProbe, cap(retChan)),
+		fingerPool:     port.NewWorkPool(fingerConcurrency, fingerConcurrency*4),
 		retChan:        retChan,
-		limiter:        limiter.NewLimiter(limiter.Every(time.Second/time.Duration(option.Rate)), option.Rate/10),
+		limiter:        limiter.NewLimiter(limiter.Limit(option.Rate), burst),
 		hostLimiter:    newHostLimiter(option.RatePreHost),
-		hostPacer:      port.NewHostPacerStore(option.RatePreHost, time.Minute, time.Now),
 		ctx:            ctx,
 		cancel:         cancel,
 		watchIpStatusT: newWatchIpStatusTable(time.Duration(option.Timeout) * time.Millisecond),
 		watchMacCacheT: newWatchMacCacheTable(),
-	}
-	if ss.hostPacer != nil {
-		ss.hostPacer.SetDebug(option.Debug, nil)
+		adaptive:       newSynAdaptiveLimiter(option.Rate, option.MiniRate, time.Now()),
+		retryChan:      make(chan pendingProbe, 64),
 	}
 	ss.sendPacket = ss.send
 
@@ -150,6 +162,13 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 		return
 	}
 	ss.handle = handle
+	ss.pcapStats = handle.Stats
+	ss.watchIpStatusT.onProbeTimeout = ss.handleProbeTimeout
+	ss.retryWg.Add(1)
+	go func() {
+		defer ss.retryWg.Done()
+		ss.retryLoop()
+	}()
 
 	// start listen recv
 	ss.recvWg.Add(1)
@@ -180,8 +199,9 @@ func NewSynScanner(firstIp net.IP, retChan chan port.OpenIpPort, option port.Sca
 }
 
 func synRecvBPFFilter(mac net.HardwareAddr) string {
+	// NDP 邻居通告没有扩展头，ICMPv6 Type 位于固定的 IPv6 负载起始偏移 40。
 	return fmt.Sprintf(
-		"ether dst %s && (arp || (ip and tcp and (tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack) || tcp[tcpflags] & tcp-rst != 0)) || (ip6 and ip6[6] = 6 and (ip6[53] & 0x12 = 0x12 || ip6[53] & 0x04 != 0)))",
+		"ether dst %s && (arp || (ip and tcp and (tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack) || tcp[tcpflags] & tcp-rst != 0)) || (ip6 and ip6[6] = 6 and (ip6[53] & 0x12 = 0x12 || ip6[53] & 0x04 != 0)) || (ip6 and ip6[6] = 58 and ip6[40] = 136))",
 		mac.String(),
 	)
 }
@@ -201,21 +221,38 @@ func configureSynRecvFilter(handle synBPFFilterHandle, mac net.HardwareAddr) err
 
 // Scan scans the dst IP address and port of this scanner.
 func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (err error) {
+	return ss.scanContext(ss.ctx, nil, false, dstIp, dst, ipOption)
+}
+
+func (ss *SynScanner) ProbeContext(ctx context.Context, dstIp net.IP, dst uint16, ipOption port.IpOption) error {
+	ctx, cancel := linkedContext(ctx, ss.ctx)
+	return ss.scanContext(ctx, cancel, true, dstIp, dst, ipOption)
+}
+
+func (ss *SynScanner) scanContext(ctx context.Context, probeCancel context.CancelFunc, applyGlobalLimit bool, dstIp net.IP, dst uint16, ipOption port.IpOption) (err error) {
+	cancelOnError := func() {
+		if err != nil && probeCancel != nil {
+			probeCancel()
+		}
+	}
+	defer cancelOnError()
+	// 原始 SYN 构包会按 IPv4/IPv6 访问地址字节，必须先拒绝不完整地址，避免库调用触发 panic。
+	if dstIp == nil || dstIp.To16() == nil {
+		return errors.New("invalid destination IP")
+	}
+	if dst == 0 {
+		return errors.New("destination port must be greater than 0")
+	}
 	if ss.isDone.Load() {
 		return io.EOF
 	}
-	if err = ss.waitHostLimiter(dstIp); err != nil {
-		return err
-	}
-	if err = ss.waitHostPacer(dstIp); err != nil {
+	if err = ss.waitHostLimiterContext(ctx, dstIp); err != nil {
 		return err
 	}
 	// wait 返回后仍可能已经被 Close/cancel，这里要在后续状态变更前再次拦截。
-	if err = ss.ctx.Err(); err != nil {
+	if err = ctx.Err(); err != nil {
 		return err
 	}
-
-	ss.changeLimiter()
 
 	ipStr := dstIp.String()
 
@@ -264,10 +301,19 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 			DstIP:      dstIp,
 		}
 	}
+	if applyGlobalLimit {
+		// 选路和邻居解析可能阻塞，全局 token 放到真正发包前获取，保证配置速率可预测。
+		if err = ss.waitGlobalLimiter(ctx); err != nil {
+			return err
+		}
+	}
 
 	startedAt := time.Now()
-	key, _, ok := ss.watchIpStatusT.ReserveProbe(ipStr, dst, startedAt, ipOption)
+	key, _, ok := ss.watchIpStatusT.ReserveProbeContext(ctx, probeCancel, ipStr, dst, startedAt, ipOption)
 	if !ok {
+		if probeCancel != nil {
+			probeCancel()
+		}
 		return errors.New("syn source port range exhausted for pending probes")
 	}
 	srcPort := key.srcPort
@@ -304,35 +350,41 @@ func (ss *SynScanner) Scan(dstIp net.IP, dst uint16, ipOption port.IpOption) (er
 			},
 		},
 	}
+	// 发送时固定抽样 1%，只有样本 probe 保存重发闭包，避免所有 pending 都携带重探状态。
+	sampleRetry := ss.adaptive != nil && ss.adaptive.shouldSampleProbe()
+	var retry func() error
 	// Send one packet per loop iteration until we've sent packets
 	if ip4 != nil {
 		tcp.SetNetworkLayerForChecksum(ip4)
-		if err = ss.sendPacket(&eth, ip4, &tcp); err != nil {
-			if probe, dropped := ss.watchIpStatusT.DropProbe(key); dropped {
-				probe.option.EmitProbeDone(port.ProbeEvent{
-					IP:        dstIp,
-					Port:      dst,
-					Outcome:   port.ProbeError,
-					Err:       err,
-					StartedAt: probe.startedAt,
-				})
-			}
-			return err
+		if sampleRetry {
+			retry = func() error { return ss.sendPacket(&eth, ip4, &tcp) }
 		}
+		err = ss.sendPacket(&eth, ip4, &tcp)
 	} else if ip6 != nil {
 		tcp.SetNetworkLayerForChecksum(ip6)
-		if err = ss.sendPacket(&eth, ip6, &tcp); err != nil {
-			if probe, dropped := ss.watchIpStatusT.DropProbe(key); dropped {
-				probe.option.EmitProbeDone(port.ProbeEvent{
-					IP:        dstIp,
-					Port:      dst,
-					Outcome:   port.ProbeError,
-					Err:       err,
-					StartedAt: probe.startedAt,
-				})
-			}
-			return err
+		if sampleRetry {
+			retry = func() error { return ss.sendPacket(&eth, ip6, &tcp) }
 		}
+		err = ss.sendPacket(&eth, ip6, &tcp)
+	}
+	if retry != nil {
+		ss.watchIpStatusT.SetRetry(key, retry)
+	}
+	if err != nil {
+		if ss.adaptive != nil {
+			ss.adaptive.recordWriteError()
+		}
+		if probe, dropped := ss.watchIpStatusT.DropProbe(key); dropped {
+			probe.option.EmitProbeDone(port.ProbeEvent{
+				IP:        dstIp,
+				Port:      dst,
+				Outcome:   port.ProbeError,
+				Err:       err,
+				StartedAt: probe.startedAt,
+			})
+			probe.cancelContext()
+		}
+		return err
 	}
 	return
 }
@@ -356,12 +408,16 @@ func (ss *SynScanner) Wait() {
 	}
 	// wait portProbe task
 	ss.portProbeWg.Wait()
+	ss.fingerPool.Wait()
 }
 
 func (ss *SynScanner) pendingProbeWaitDuration() time.Duration {
 	timeout := time.Duration(ss.option.Timeout) * time.Millisecond
 	if timeout <= 0 {
 		timeout = time.Duration(DefaultSynOption.Timeout) * time.Millisecond
+	}
+	if ss.adaptive != nil && ss.adaptive.enabled {
+		return 2*timeout + 2*watchIpStatusSweepInterval + 100*time.Millisecond
 	}
 	return timeout + watchIpStatusSweepInterval + 100*time.Millisecond
 }
@@ -373,6 +429,7 @@ func (ss *SynScanner) Close() {
 		if ss.cancel != nil {
 			ss.cancel()
 		}
+		ss.retryWg.Wait()
 		if ss.handle != nil {
 			// In linux, pcap can not stop when no packets to sniff with BlockForever
 			// ref:https://github.com/google/gopacket/issues/890
@@ -402,7 +459,9 @@ func (ss *SynScanner) Close() {
 			}
 			buf.Clear()
 			ss.bufPool.Put(buf)
+			ss.sendMu.Lock()
 			ss.handle.Close()
+			ss.sendMu.Unlock()
 		}
 		if ss.watchMacCacheT != nil {
 			ss.watchMacCacheT.Close()
@@ -416,110 +475,127 @@ func (ss *SynScanner) Close() {
 		// portProbeHandle drains openPortChan and owns all probe workers.
 		ss.probeLoopWg.Wait()
 		ss.portProbeWg.Wait()
+		ss.fingerPool.Close()
 	})
 }
 
 // WaitLimiter Waiting for the speed limit
 func (ss *SynScanner) WaitLimiter() error {
-	return ss.limiter.Wait(ss.ctx)
+	return ss.waitGlobalLimiter(ss.ctx)
+}
+
+func (ss *SynScanner) waitGlobalLimiter(ctx context.Context) error {
+	if ss.limiter == nil {
+		return nil
+	}
+	ss.evaluateAdaptiveRate(time.Now())
+	return ss.limiter.Wait(ctx)
+}
+
+func (ss *SynScanner) evaluateAdaptiveRate(now time.Time) {
+	if ss.adaptive == nil || !ss.adaptive.beginEvaluation(now) {
+		return
+	}
+	var stats *pcap.Stats
+	if ss.pcapStats != nil {
+		stats, _ = ss.pcapStats()
+	}
+	pending := 0
+	if ss.watchIpStatusT != nil {
+		pending = ss.watchIpStatusT.Len()
+	}
+	const pendingCapacity = int(synSourcePortMax-synSourcePortMin) + 1
+	newRate, reason, changed := ss.adaptive.evaluateClaimed(pending, pendingCapacity, stats)
+	if !changed {
+		return
+	}
+	oldRate := int(ss.limiter.Limit())
+	applyAdaptiveRate(ss.limiter, now, newRate)
+	if ss.option.Debug {
+		fmt.Printf("[d] SYN 自适应调速 old_rate=%d new_rate=%d reason=%s pending=%d\n", oldRate, newRate, reason, pending)
+	}
+}
+
+func (ss *SynScanner) handleProbeTimeout(probe pendingProbe) bool {
+	if probe.retried {
+		if ss.adaptive != nil {
+			ss.adaptive.recordRetry(false)
+		}
+		return false
+	}
+	if ss.adaptive == nil || probe.retry == nil || ss.retryChan == nil {
+		return false
+	}
+	probe.retried = true
+	probe.sentAt = time.Time{}
+	if !ss.watchIpStatusT.RearmProbe(probe) {
+		return false
+	}
+	select {
+	case ss.retryChan <- probe:
+		return true
+	default:
+		ss.watchIpStatusT.DropProbe(probe.key)
+		return false
+	}
+}
+
+func (ss *SynScanner) retryLoop() {
+	for {
+		select {
+		case <-ss.ctx.Done():
+			return
+		case probe := <-ss.retryChan:
+			if err := ss.waitGlobalLimiter(probe.context()); err != nil {
+				ss.finishRetryError(probe, err)
+				continue
+			}
+			if !ss.watchIpStatusT.TouchProbe(probe.key, time.Now()) {
+				continue
+			}
+			if err := probe.retry(); err != nil {
+				if ss.adaptive != nil {
+					ss.adaptive.recordWriteError()
+				}
+				ss.finishRetryError(probe, err)
+			}
+		}
+	}
+}
+
+func (ss *SynScanner) finishRetryError(probe pendingProbe, err error) {
+	tracked, ok := ss.watchIpStatusT.DropProbe(probe.key)
+	if !ok {
+		return
+	}
+	outcome := port.ProbeError
+	if tracked.context().Err() != nil || errors.Is(err, context.Canceled) {
+		outcome = port.ProbeAborted
+	}
+	tracked.option.EmitProbeDone(port.ProbeEvent{
+		IP:        net.ParseIP(tracked.key.ip),
+		Port:      tracked.key.dstPort,
+		Outcome:   outcome,
+		Err:       err,
+		StartedAt: tracked.startedAt,
+	})
+	tracked.cancelContext()
 }
 
 func (ss *SynScanner) waitHostLimiter(ip net.IP) error {
+	return ss.waitHostLimiterContext(ss.ctx, ip)
+}
+
+func (ss *SynScanner) waitHostLimiterContext(ctx context.Context, ip net.IP) error {
 	if ss.hostLimiter == nil || ip == nil {
 		return nil
 	}
-	return ss.hostLimiter.Wait(ss.ctx, ip.String())
-}
-
-func (ss *SynScanner) waitHostPacer(ip net.IP) error {
-	if ss.hostPacer == nil || ip == nil {
-		return nil
-	}
-	return ss.hostPacer.Wait(ss.ctx, ip.String())
-}
-
-func (ss *SynScanner) observeHostSample(host string, sample port.HostSample) {
-	if ss.hostPacer == nil {
-		return
-	}
-	ss.hostPacer.Observe(host, sample)
+	return ss.hostLimiter.Wait(ctx, ip.String())
 }
 
 // GetDevName Get the device name after the route selection
 func (ss *SynScanner) GetDevName() string {
 	return ss.devName
-}
-
-// changeLimiter
-func (ss *SynScanner) changeLimiter() {
-	// 忽略第一次执行
-	if ss.lastStatProbeTime.Equal(time.Time{}) {
-		ss.lastRate = ss.option.Rate
-		ss.lastStatProbeTime = time.Now()
-		return
-	}
-	// 每 2s 判断一次
-	if time.Since(ss.lastStatProbeTime) < 2*time.Second {
-		return
-	}
-	ss.lastStatProbeTime = time.Now()
-
-	var setLimit = func(rate int, emergency bool) {
-		if rate <= 0 {
-			rate = 10
-		}
-		if rate > ss.option.Rate {
-			rate = ss.option.Rate
-		} else if !emergency && ss.option.MiniRate > 0 && ss.option.MiniRate < ss.option.Rate && rate < ss.option.MiniRate {
-			rate = ss.option.MiniRate
-		}
-		ss.lastRate = rate
-		if ss.option.Debug {
-			fmt.Printf("[d] syn rate:%d packets/s\n", rate)
-		}
-		ss.limiter.SetLimit(limiter.Every(time.Second / time.Duration(rate)))
-	}
-
-	// 计算recv队列使用率（乘以10的整数）
-	ratio10 := (len(ss.openPortChan) * 10) / cap(ss.openPortChan)
-	// 当队列缓冲区到达80%时减少队列长度的50%，90%降为100/s
-	if ratio10 >= 9 {
-		setLimit(100, true)
-	} else if ratio10 >= 8 {
-		setLimit(ss.lastRate-cap(ss.openPortChan)/2, false)
-	} else {
-		aTokens := int(ss.limiter.Tokens()) // 通过判断limiter是否还有可使用Tokens，判断发送速度是否是贴着网卡最大发送速度，理想情况下应该为网卡最大处理速度小一点
-		if ss.option.Debug {
-			fmt.Println("[d] limiter tokens:", aTokens)
-		}
-		if aTokens > 0 {
-			if (aTokens+1)*10 >= ss.option.Rate { // 最大可用token连续出现次数
-				if ss.lastMaxTokenTimes < 8 {
-					ss.lastMaxTokenTimes++
-				}
-			} else {
-				ss.lastMaxTokenTimes = 0
-			}
-			if ss.lastMaxTokenTimes > 1 {
-				setLimit(ss.lastRate-aTokens*ss.lastMaxTokenTimes, false)
-			} else {
-				setLimit(ss.lastRate-aTokens-10, false)
-			}
-		} else if aTokens < -50 { // 恢复速度到使端口发包等待50个组(tokens 会为负数)
-			if aTokens+1 <= 196 { // 最小可用token连续出现次数
-				if ss.lastMinTokenTimes < 8 {
-					ss.lastMinTokenTimes++
-				}
-			} else {
-				ss.lastMinTokenTimes = 0
-			}
-			if ss.lastMinTokenTimes > 1 {
-				setLimit(ss.lastRate-aTokens*ss.lastMinTokenTimes, false)
-			} else {
-				setLimit(ss.lastRate-aTokens-10, false)
-			}
-		}
-	}
 }
 
 func newHostLimiter(ratePerHost int) hostLimiter {
@@ -535,24 +611,33 @@ func (ss *SynScanner) macResolveTimeout() time.Duration {
 
 func (ss *SynScanner) portProbeHandle() {
 	for _openProbe := range ss.openPortChan {
-		openIpPort := _openProbe.result
+		openProbe := _openProbe
+		openIpPort := openProbe.result
+		probeCtx := openProbe.probe.ctx
+		if probeCtx == nil {
+			probeCtx = ss.ctx
+		}
 		if !openIpPort.FingerPrint && !openIpPort.Httpx {
-			_ = port.EmitOpenProbeResult(ss.ctx, ss.retChan, openIpPort, _openProbe.probe.startedAt)
+			_ = port.EmitOpenProbeResult(probeCtx, ss.retChan, openIpPort, openProbe.probe.startedAt)
+			openProbe.probe.cancelContext()
 			ss.portProbeWg.Done()
 		} else {
-			go func(_openProbe synOpenProbe) {
+			if ss.fingerPool.TrySubmit(func() {
 				defer func() {
+					openProbe.probe.cancelContext()
 					ss.portProbeWg.Done()
 				}()
-				openIpPort := _openProbe.result
+				openIpPort := openProbe.result
+				fingerTimeout := ss.option.FingerTimeoutDuration()
+				fingerCtx, cancel := context.WithTimeout(probeCtx, fingerTimeout)
+				defer cancel()
 				if openIpPort.Port != 0 {
 					// openPortChan already carries a confirmed open port; probe failures only skip enrichment.
-					fingerTimeout := ss.option.FingerTimeoutDuration()
 					if openIpPort.FingerPrint {
-						openIpPort.Service, openIpPort.Banner, _ = fingerprint.PortIdentify("tcp", openIpPort.Ip, openIpPort.Port, fingerTimeout)
+						openIpPort.Service, openIpPort.Banner, _ = fingerprint.PortIdentifyContext(fingerCtx, "tcp", openIpPort.Ip, openIpPort.Port, fingerTimeout)
 					}
 					if openIpPort.Httpx && (openIpPort.Service == "" || openIpPort.Service == "http" || openIpPort.Service == "https") {
-						openIpPort.HttpInfo, openIpPort.Banner, _ = fingerprint.ProbeHttpInfo(openIpPort.Ip.String(), openIpPort.Port, openIpPort.Service, fingerTimeout)
+						openIpPort.HttpInfo, openIpPort.Banner, _ = fingerprint.ProbeHttpInfoContext(fingerCtx, openIpPort.Ip.String(), openIpPort.Port, openIpPort.Service, fingerTimeout)
 						if openIpPort.HttpInfo != nil {
 							if strings.HasPrefix(openIpPort.HttpInfo.Url, "https") {
 								openIpPort.Service = "https"
@@ -562,8 +647,14 @@ func (ss *SynScanner) portProbeHandle() {
 						}
 					}
 				}
-				_ = port.EmitOpenProbeResult(ss.ctx, ss.retChan, openIpPort, _openProbe.probe.startedAt)
-			}(_openProbe)
+				_ = port.EmitOpenProbeResult(probeCtx, ss.retChan, openIpPort, openProbe.probe.startedAt)
+			}) {
+				continue
+			}
+			openIpPort.Service = "unknown"
+			_ = port.EmitOpenProbeResult(probeCtx, ss.retChan, openIpPort, openProbe.probe.startedAt)
+			openProbe.probe.cancelContext()
+			ss.portProbeWg.Done()
 		}
 	}
 }
@@ -734,6 +825,16 @@ func (ss *SynScanner) send(l ...gopacket.SerializableLayer) error {
 	if err := gopacket.SerializeLayers(buf, ss.opts, l...); err != nil {
 		return err
 	}
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	if ss.isDone.Load() || ss.handle == nil {
+		if ss.ctx != nil {
+			if err := ss.ctx.Err(); err != nil {
+				return err
+			}
+		}
+		return io.EOF
+	}
 	return ss.handle.WritePacketData(buf.Bytes())
 }
 
@@ -746,6 +847,16 @@ func (ss *SynScanner) sendArp(l ...gopacket.SerializableLayer) error {
 	}()
 	if err := gopacket.SerializeLayers(buf, ss.opts, l...); err != nil {
 		return err
+	}
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	if ss.isDone.Load() || ss.handle == nil {
+		if ss.ctx != nil {
+			if err := ss.ctx.Err(); err != nil {
+				return err
+			}
+		}
+		return io.EOF
 	}
 	return ss.handle.WritePacketData(buf.Bytes()[:42]) // need fix padding
 }
@@ -782,6 +893,7 @@ func (ss *SynScanner) recv() {
 	// Decode
 	var ipLayer layers.IPv4
 	var ipv6Layer layers.IPv6
+	var ipv6IcmpLayer layers.ICMPv6
 	var ipv6IcmpNALayer layers.ICMPv6NeighborAdvertisement
 	var tcpLayer layers.TCP
 	var arpLayer layers.ARP
@@ -796,6 +908,8 @@ func (ss *SynScanner) recv() {
 		&ipv6Layer,
 		&tcpLayer,
 		&arpLayer,
+		// IPv6 的 NA 位于 ICMPv6 负载中，不能跳过通用 ICMPv6 解码层。
+		&ipv6IcmpLayer,
 		&ipv6IcmpNALayer,
 	)
 
@@ -837,13 +951,11 @@ func (ss *SynScanner) recv() {
 			continue
 		}
 
-		// ipv6NA
-		if len(ipv6IcmpNALayer.Options) != 0 {
-			ipStr = net.IP(arpLayer.SourceProtAddress).String()
-			if ss.watchMacCacheT.IsNeedWatch(ipStr) {
-				ss.watchMacCacheT.SetMac(ipStr, arpLayer.SourceHwAddress)
-			}
-			ipv6IcmpNALayer.Options = []layers.ICMPv6Option{} // clean arp parse status
+		// IPv6 NA
+		if ipv6IcmpNALayer.TargetAddress != nil {
+			ss.cacheIPv6NeighborAdvertisement(ipv6IcmpNALayer.TargetAddress, ethLayer.SrcMAC)
+			ipv6IcmpNALayer.TargetAddress = nil
+			ipv6IcmpNALayer.Options = nil
 			continue
 		}
 
@@ -868,8 +980,8 @@ func (ss *SynScanner) recv() {
 					ss.portProbeWg.Done()
 					continue
 				}
-				if !probe.sentAt.IsZero() {
-					ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(probe.sentAt), HasRTT: true})
+				if probe.retried && ss.adaptive != nil {
+					ss.adaptive.recordRetry(true)
 				}
 				if !ss.enqueueTrackedOpenPort(synOpenProbe{
 					result: port.OpenIpPort{
@@ -885,6 +997,7 @@ func (ss *SynScanner) recv() {
 						Outcome:   port.ProbeAborted,
 						StartedAt: probe.startedAt,
 					})
+					probe.cancelContext()
 					return
 				}
 				// reply to target
@@ -906,8 +1019,8 @@ func (ss *SynScanner) recv() {
 				if !has { // IP/PORT no matching probe
 					continue
 				}
-				if !probe.sentAt.IsZero() {
-					ss.observeHostSample(ipStr, port.HostSample{RTT: time.Since(probe.sentAt), HasRTT: true})
+				if probe.retried && ss.adaptive != nil {
+					ss.adaptive.recordRetry(true)
 				}
 				probe.option.EmitProbeDone(port.ProbeEvent{
 					IP:        disIp,
@@ -915,6 +1028,7 @@ func (ss *SynScanner) recv() {
 					Outcome:   port.ProbeClosed,
 					StartedAt: probe.startedAt,
 				})
+				probe.cancelContext()
 			}
 			tcpLayer.DstPort = 0 // clean tcp parse status
 		}
@@ -941,5 +1055,27 @@ func (ss *SynScanner) enqueueTrackedOpenPort(openProbe synOpenProbe) bool {
 	case <-ss.ctx.Done():
 		ss.portProbeWg.Done()
 		return false
+	}
+}
+
+func (ss *SynScanner) cacheIPv6NeighborAdvertisement(target net.IP, sourceMAC net.HardwareAddr) {
+	if ss.watchMacCacheT == nil || target == nil || len(sourceMAC) == 0 {
+		return
+	}
+	ipStr := target.String()
+	if ss.watchMacCacheT.IsNeedWatch(ipStr) {
+		ss.watchMacCacheT.SetMac(ipStr, sourceMAC)
+	}
+}
+
+func linkedContext(parent, scanner context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(scanner, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
 	}
 }

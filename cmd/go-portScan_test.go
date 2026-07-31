@@ -2,13 +2,15 @@ package main
 
 import (
 	"flag"
-	"github.com/XinRoom/go-portScan/core/port"
-	"github.com/urfave/cli/v2"
 	"io"
 	"log"
 	"net"
 	"sync"
 	"testing"
+
+	"github.com/XinRoom/go-portScan/core/port"
+	"github.com/XinRoom/go-portScan/core/port/syn"
+	"github.com/urfave/cli/v2"
 )
 
 func TestParseFlagBuildsScannerOptionWithRatePreHost(t *testing.T) {
@@ -44,6 +46,23 @@ func TestParseFlagBuildsScannerOptionWithRatePreHost(t *testing.T) {
 	}
 	if option.NextHop != "" {
 		t.Fatalf("expected empty NextHop, got %q", option.NextHop)
+	}
+}
+
+func TestNormalizeSynScannerOptionUsesAdaptiveDefaults(t *testing.T) {
+	got := normalizeSynScannerOption(port.ScannerOption{Rate: -1, MiniRate: -1})
+	if got.Rate != syn.DefaultSynOption.Rate || got.MiniRate != syn.DefaultSynOption.MiniRate {
+		t.Fatalf("unexpected SYN defaults: %+v", got)
+	}
+
+	got = normalizeSynScannerOption(port.ScannerOption{Rate: 300, MiniRate: -1})
+	if got.MiniRate != 300 {
+		t.Fatalf("miniRate should be capped by explicit rate, got %+v", got)
+	}
+
+	got = normalizeSynScannerOption(port.ScannerOption{Rate: 600, MiniRate: 0})
+	if got.MiniRate != 0 {
+		t.Fatalf("explicit zero must keep adaptive rate disabled, got %+v", got)
 	}
 }
 

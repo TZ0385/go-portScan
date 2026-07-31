@@ -134,12 +134,17 @@ func (p *HostPacerStore) loadOrCreate(host string) *hostPacerEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for k, v := range p.store {
-		if p.ttl > 0 && now.Sub(v.lastSeen) > p.ttl {
+		v.mu.Lock()
+		lastSeen := v.lastSeen
+		v.mu.Unlock()
+		if p.ttl > 0 && now.Sub(lastSeen) > p.ttl {
 			delete(p.store, k)
 		}
 	}
 	if entry, ok := p.store[host]; ok {
+		entry.mu.Lock()
 		entry.lastSeen = now
+		entry.mu.Unlock()
 		return entry
 	}
 	entry := &hostPacerEntry{lastSeen: now, baseGap: time.Second / time.Duration(p.rate), maxExtraGap: 2 * time.Second}

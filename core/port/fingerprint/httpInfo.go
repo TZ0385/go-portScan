@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -36,6 +37,10 @@ func getHTTPClient(dialTimeout time.Duration) *http.Client {
 }
 
 func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
+	return ProbeHttpInfoContext(context.Background(), host, _port, topScheme, dialTimeout)
+}
+
+func ProbeHttpInfoContext(ctx context.Context, host string, _port uint16, topScheme string, dialTimeout time.Duration) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
 	var schemes []string
 
 	if util.IsUint16InList(_port, httpsTopPort) || topScheme == "https" {
@@ -51,7 +56,7 @@ func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time
 
 		var httpInfo2 *port.HttpInfo
 		var banner2 []byte
-		httpInfo2, banner2, isDialErr = WebHttpInfo(url2, dialTimeout, true)
+		httpInfo2, banner2, isDialErr = WebHttpInfoContext(ctx, url2, dialTimeout, true)
 		if isDialErr {
 			return
 		}
@@ -69,6 +74,13 @@ func ProbeHttpInfo(host string, _port uint16, topScheme string, dialTimeout time
 }
 
 func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
+	return WebHttpInfoContext(context.Background(), url2, dialTimeout, favicon)
+}
+
+func WebHttpInfoContext(ctx context.Context, url2 string, dialTimeout time.Duration, favicon bool) (httpInfo *port.HttpInfo, banner []byte, isDialErr bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	httpClient := getHTTPClient(dialTimeout)
 
 	var err error
@@ -78,7 +90,7 @@ func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo
 	var b bytes.Buffer
 	defer b.Reset()
 
-	resps, body, err = getReq(httpClient, url2, 1)
+	resps, body, err = getReq(ctx, httpClient, url2, 1)
 	if err != nil {
 		if isDialOrTimeoutErr(err) {
 			return nil, banner, true
@@ -128,7 +140,7 @@ func WebHttpInfo(url2 string, dialTimeout time.Duration, favicon bool) (httpInfo
 			if err != nil {
 				return
 			}
-			resps2, body2, err2 := getReq(httpClient, faviconURL, 0)
+			resps2, body2, err2 := getReq(ctx, httpClient, faviconURL, 0)
 			if err2 == nil && len(body2) != 0 && len(resps2) > 0 && resps2[0].StatusCode == 200 && strings.Contains(resps2[0].Header.Get("Content-Type"), "image") {
 				httpInfo.Favicon = body2
 				httpInfo.FaviconHash = webfinger.WebFaviconHash(body2)
@@ -167,7 +179,7 @@ func traceRemoteHost(addr string) string {
 	return addr
 }
 
-func getReq(httpClient *http.Client, url2 string, maxRewriteNum int) (resps []*http.Response, body []byte, err error) {
+func getReq(ctx context.Context, httpClient *http.Client, url2 string, maxRewriteNum int) (resps []*http.Response, body []byte, err error) {
 	var rewriteNum int
 	var req *http.Request
 	for {
@@ -178,7 +190,7 @@ func getReq(httpClient *http.Client, url2 string, maxRewriteNum int) (resps []*h
 				connectAddr = traceRemoteHost(addr)
 			},
 		}
-		req, err = http.NewRequest(http.MethodGet, url2, http.NoBody)
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, url2, http.NoBody)
 		if err != nil {
 			return
 		}

@@ -126,6 +126,34 @@ type Scanner interface {
 	WaitLimiter() error
 }
 
+// ContextScanner 是长生命周期共享 scanner 的可取消入口。
+// ProbeContext 在 scanner 内部统一取得全局限速额度，避免调用方漏掉 WaitLimiter 而绕过限速。
+type ContextScanner interface {
+	Scanner
+	ProbeContext(context.Context, net.IP, uint16, IpOption) error
+}
+
+// ProbeContext 优先使用可取消入口；旧 Scanner 则退化为 WaitLimiter + Scan，保持接口兼容。
+func ProbeContext(ctx context.Context, scanner Scanner, ip net.IP, dst uint16, option IpOption) error {
+	if contextual, ok := scanner.(ContextScanner); ok {
+		return contextual.ProbeContext(ctx, ip, dst, option)
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if err := scanner.WaitLimiter(); err != nil {
+		return err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return scanner.Scan(ip, dst, option)
+}
+
 // OpenIpPort retChan
 type OpenIpPort struct {
 	Ip       net.IP    `json:"ip"`
@@ -159,12 +187,16 @@ func (op OpenIpPort) Json() string {
 type ScannerOption struct {
 	Rate        int // 每秒速度限制, 单位: s, 会在1s内平均发送, 相当于每个包之间的延迟
 	RatePreHost int // 单个 host 每秒速度限制, 0 为不限制
-	MiniRate    int // 最小每秒速度，避免自动调速太低, 单位: s,  0为不设置
+	MiniRate    int // SYN 自适应调速下限；<=0 或 >=Rate 时关闭自适应，TCP 忽略。
 	Timeout     int // TCP连接响应延迟, 单位: ms
 	// FingerTimeout controls active service/http fingerprint probes, in ms.
 	FingerTimeout int
-	NextHop       string // pcap dev name
-	Debug         bool
+	// MaxConcurrent bounds in-flight TCP connections. Zero uses the scanner default.
+	MaxConcurrent int
+	// FingerConcurrency bounds active service/http enrichment. Zero uses the scanner default.
+	FingerConcurrency int
+	NextHop           string // pcap dev name
+	Debug             bool
 }
 
 func NormalizeMiniRate(rate, miniRate int) int {
@@ -358,8 +390,19 @@ func IsInPortRange(port uint16, portRanges [][]uint16) bool {
 
 // ShuffleParseAndMergeTopPorts shuffle parse portStr and merge TopTcpPorts
 func ShuffleParseAndMergeTopPorts(portStr string) (ports []uint16, err error) {
+	// TopTcpPorts 是全局表且历史数据可能重复；扫描计划必须去重并返回独立切片。
+	appendTopPort := func(selected map[uint16]struct{}, value uint16) {
+		if _, exists := selected[value]; exists {
+			return
+		}
+		selected[value] = struct{}{}
+		ports = append(ports, value)
+	}
 	if portStr == "" {
-		ports = TopTcpPorts
+		selectedTopPort := make(map[uint16]struct{}, len(TopTcpPorts))
+		for _, value := range TopTcpPorts {
+			appendTopPort(selectedTopPort, value)
+		}
 		return
 	}
 	var portRanges [][]uint16
@@ -372,8 +415,7 @@ func ShuffleParseAndMergeTopPorts(portStr string) (ports []uint16, err error) {
 	hasTopStr := strings.Contains(portStr, "top1000")
 	for _, _port := range TopTcpPorts {
 		if hasTopStr || IsInPortRange(_port, portRanges) {
-			selectTopPort[_port] = struct{}{}
-			ports = append(ports, _port)
+			appendTopPort(selectTopPort, _port)
 		}
 	}
 	selectPort := make(map[uint16]struct{}) // OtherPort

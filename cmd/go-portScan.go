@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -220,9 +221,7 @@ func run(c *cli.Context) error {
 		s, err = tcp.NewTcpScanner(retChan, option)
 	} else {
 		// syn
-		if option.Rate == -1 {
-			option.Rate = syn.DefaultSynOption.Rate
-		}
+		option = normalizeSynScannerOption(option)
 		if option.Timeout == -1 {
 			option.Timeout = syn.DefaultSynOption.Timeout
 		}
@@ -246,7 +245,10 @@ func run(c *cli.Context) error {
 			ipPortNumRW.Unlock()
 		}
 		for _, _port := range ports { // port
-			s.WaitLimiter() // limit rate
+			if err := s.WaitLimiter(); err != nil {
+				// 扫描器关闭会取消限速等待，当前 host 不再继续提交端口。
+				break
+			}
 
 			if maxOpenPort > 0 {
 				ipPortNumRW.RLock()
@@ -256,8 +258,9 @@ func run(c *cli.Context) error {
 					break
 				}
 			}
-			time.Sleep(time.Millisecond)
 			s.Scan(ip, _port, ipOption)
+			// 让出当前时间片，便于不同 host 的端口任务交替；不使用 Sleep，避免 Windows 定时精度把实际速率压低。
+			runtime.Gosched()
 		}
 		if maxOpenPort > 0 {
 			ipPortNumRW.Lock()
@@ -309,6 +312,18 @@ func run(c *cli.Context) error {
 	<-single          // 接收器-收
 	myLog.Printf("[*] elapsed time: %s\n", time.Since(start))
 	return nil
+}
+
+func normalizeSynScannerOption(option port.ScannerOption) port.ScannerOption {
+	if option.Rate == -1 {
+		option.Rate = syn.DefaultSynOption.Rate
+	}
+	if option.MiniRate == -1 {
+		option.MiniRate = syn.DefaultSynOption.MiniRate
+	}
+	// 用户显式把上限设低时，下限不能超过上限；两者相等则自然退化为固定速率。
+	option.MiniRate = port.NormalizeMiniRate(option.Rate, option.MiniRate)
+	return option
 }
 
 func scannerOptionFromFlags() port.ScannerOption {

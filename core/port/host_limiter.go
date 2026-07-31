@@ -22,7 +22,6 @@ func (e *hostLimiterEntry) acquire(now time.Time) {
 	e.mu.Unlock()
 }
 
-
 func (e *hostLimiterEntry) release(now time.Time) {
 	e.mu.Lock()
 	if e.active > 0 {
@@ -39,11 +38,12 @@ func (e *hostLimiterEntry) state() (time.Time, int) {
 }
 
 type HostLimiterStore struct {
-	rate    int
-	ttl     time.Duration
-	now     func() time.Time
-	mu      sync.Mutex
-	entries sync.Map
+	rate      int
+	ttl       time.Duration
+	now       func() time.Time
+	lastSweep time.Time
+	mu        sync.Mutex
+	entries   sync.Map
 }
 
 func NewHostLimiterStore(ratePerHost int) *HostLimiterStore {
@@ -58,9 +58,10 @@ func newHostLimiterStore(ratePerHost int, ttl time.Duration, now func() time.Tim
 		now = time.Now
 	}
 	return &HostLimiterStore{
-		rate: ratePerHost,
-		ttl:  ttl,
-		now:  now,
+		rate:      ratePerHost,
+		ttl:       ttl,
+		now:       now,
+		lastSweep: now(),
 	}
 }
 
@@ -91,8 +92,8 @@ func (s *HostLimiterStore) acquireOrCreate(host string, now time.Time) *hostLimi
 		s.entries.Delete(host)
 	}
 
-	// 仅在新增 host 时清理过期项，避免每次等待都全表扫描。
-	s.sweepExpired(now)
+	// 新 host 可能非常多，全表清理最多每个 TTL 执行一次，避免大网段下退化为 O(n²)。
+	s.sweepExpiredIfDue(now)
 	entry := &hostLimiterEntry{
 		limiter:  limiter.NewLimiter(limiter.Limit(s.rate), 1),
 		lastSeen: now,
@@ -104,31 +105,6 @@ func (s *HostLimiterStore) acquireOrCreate(host string, now time.Time) *hostLimi
 		return actualEntry
 	}
 	return entry
-}
-
-func (s *HostLimiterStore) loadOrCreate(host string, now time.Time) *hostLimiterEntry {
-	if entry, ok := s.loadFresh(host, now); ok {
-		return entry
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if entry, ok := s.loadFresh(host, now); ok {
-		return entry
-	}
-	if entry, ok := s.entries.Load(host); ok && s.isExpired(entry.(*hostLimiterEntry), now) {
-		s.entries.Delete(host)
-	}
-
-	// 仅在新增 host 时清理过期项，避免每次等待都全表扫描。
-	s.sweepExpired(now)
-	entry := &hostLimiterEntry{
-		limiter:  limiter.NewLimiter(limiter.Limit(s.rate), 1),
-		lastSeen: now,
-	}
-	actual, _ := s.entries.LoadOrStore(host, entry)
-	return actual.(*hostLimiterEntry)
 }
 
 func (s *HostLimiterStore) loadFresh(host string, now time.Time) (*hostLimiterEntry, bool) {
@@ -167,4 +143,13 @@ func (s *HostLimiterStore) sweepExpired(now time.Time) {
 		}
 		return true
 	})
+}
+
+// 调用方持有 s.mu，因此无需额外定时 goroutine 或锁。
+func (s *HostLimiterStore) sweepExpiredIfDue(now time.Time) {
+	if s.ttl <= 0 || now.Sub(s.lastSweep) < s.ttl {
+		return
+	}
+	s.sweepExpired(now)
+	s.lastSweep = now
 }
